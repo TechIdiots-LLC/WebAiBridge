@@ -1,0 +1,34 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install & build VSCode extension
+        working-directory: vscode-extension
+        run: |
+          npm ci
+          npm run compile
+
+      - name: Typecheck VSCode extension
+        working-directory: vscode-extension
+        run: |
+          npx tsc -p ./tsconfig.json --noEmit
+
+      - name: Validate web extension files
+        run: |
+          ls -la web-extension || true
+          test -f web-extension/src/content.js

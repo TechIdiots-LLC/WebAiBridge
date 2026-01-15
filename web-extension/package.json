@@ -1,0 +1,11 @@
+﻿{
+  "name": "webaibridge-web-prototype",
+  "version": "0.0.1",
+  "description": "Prototype web extension",
+  "scripts": {
+    "build": "echo 'No build step for prototype'"
+  },
+  "dependencies": {
+    "tiktoken": "^1.0.10"
+  }
+}

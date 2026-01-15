@@ -1,0 +1,96 @@
+﻿<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>WebAiBridge</title>
+    <style>
+      body{font-family:system-ui,Segoe UI,Arial;padding:12px;width:360px}
+      .warning{background:#fff3cd;border:1px solid #ffc107;padding:8px;margin:8px 0;border-radius:4px;color:#856404}
+      .error{background:#f8d7da;border:1px solid #dc3545;padding:8px;margin:8px 0;border-radius:4px;color:#721c24}
+      .success{background:#d4edda;border:1px solid #28a745;padding:8px;margin:8px 0;border-radius:4px;color:#155724}
+      select{padding:4px;margin:4px 0;width:100%}
+      .token-info{font-size:13px;margin:8px 0}
+      
+      /* Chip styles */
+      .chips-section{margin:12px 0;border:1px solid #ddd;border-radius:6px;padding:8px}
+      .chips-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+      .chips-header h4{margin:0;font-size:14px}
+      .chips-count{font-size:12px;color:#666}
+      .chips-list{max-height:200px;overflow-y:auto}
+      .chip{display:flex;align-items:center;justify-content:space-between;padding:6px 8px;margin:4px 0;background:#f5f5f5;border-radius:4px;font-size:12px}
+      .chip-info{flex:1;overflow:hidden}
+      .chip-label{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .chip-meta{color:#666;font-size:11px}
+      .chip-remove{background:none;border:none;color:#999;cursor:pointer;padding:2px 6px;font-size:14px}
+      .chip-remove:hover{color:#dc3545}
+      .chips-empty{color:#999;font-style:italic;font-size:12px;padding:8px 0}
+      .chips-actions{display:flex;gap:6px;margin-top:8px}
+      .chips-actions button{flex:1;padding:6px;font-size:12px;cursor:pointer;border:1px solid #ddd;border-radius:4px;background:#fff}
+      .chips-actions button:hover{background:#f0f0f0}
+      .chips-actions button.primary{background:#007bff;color:#fff;border-color:#007bff}
+      .chips-actions button.primary:hover{background:#0056b3}
+      .chips-actions button.danger{color:#dc3545;border-color:#dc3545}
+      .chips-actions button.danger:hover{background:#dc3545;color:#fff}
+      .chips-total{font-size:11px;color:#666;margin-top:6px;text-align:right}
+    </style>
+  </head>
+  <body>
+    <h3>WebAiBridge</h3>
+    <div id="status">Not connected</div>
+    
+    <div style="margin:8px 0">
+      <label for="modelSelect">Model:</label>
+      <select id="modelSelect">
+        <optgroup label="GPT-4 Models">
+          <option value="gpt-4o">GPT-4o (128K tokens)</option>
+          <option value="gpt-4o-mini">GPT-4o Mini (128K tokens)</option>
+          <option value="gpt-4-turbo">GPT-4 Turbo (128K tokens)</option>
+          <option value="gpt-4">GPT-4 (8K tokens)</option>
+          <option value="gpt-4-32k">GPT-4-32K (32K tokens)</option>
+        </optgroup>
+        <optgroup label="GPT-3.5 Models">
+          <option value="gpt-3.5-turbo">GPT-3.5 Turbo (4K tokens)</option>
+          <option value="gpt-3.5-turbo-16k">GPT-3.5 Turbo 16K</option>
+        </optgroup>
+        <optgroup label="Claude Models">
+          <option value="claude-3.5-sonnet">Claude 3.5 Sonnet (200K tokens)</option>
+          <option value="claude-3-opus">Claude 3 Opus (200K tokens)</option>
+          <option value="claude-3-sonnet">Claude 3 Sonnet (200K tokens)</option>
+          <option value="claude-3-haiku">Claude 3 Haiku (200K tokens)</option>
+        </optgroup>
+        <optgroup label="Gemini Models">
+          <option value="gemini-1.5-pro">Gemini 1.5 Pro (1M tokens)</option>
+          <option value="gemini-1.5-flash">Gemini 1.5 Flash (1M tokens)</option>
+          <option value="gemini-pro">Gemini Pro (32K tokens)</option>
+        </optgroup>
+      </select>
+    </div>
+    
+    <!-- Context Chips Section -->
+    <div class="chips-section">
+      <div class="chips-header">
+        <h4>📎 Context Chips</h4>
+        <span class="chips-count" id="chipsCount">0 chips</span>
+      </div>
+      <div class="chips-list" id="chipsList">
+        <div class="chips-empty">No context chips. Add from VS Code using "Add Selection to Context" or "Add File to Context".</div>
+      </div>
+      <div class="chips-total" id="chipsTotal"></div>
+      <div class="chips-actions" id="chipsActions" style="display:none">
+        <button class="primary" id="insertAllChips">Insert All</button>
+        <button class="danger" id="clearChips">Clear All</button>
+      </div>
+    </div>
+    
+    <div class="token-info">
+      <div id="tokenDisplay">Last sent: <span id="lastTokens">-</span></div>
+      <div id="tokenWarning" style="display:none"></div>
+    </div>
+    
+    <div style="margin:6px 0;align-items:center">
+      <label><input type="checkbox" id="autoInsert"> Auto-insert into focused field</input></label>
+    </div>
+    <script src="tokenizer.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

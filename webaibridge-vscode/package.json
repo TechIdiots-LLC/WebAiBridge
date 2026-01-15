@@ -1,0 +1,137 @@
+{
+  "name": "webaibridge-vscode-prototype",
+  "displayName": "WebAiBridge (Prototype)",
+  "description": "Bridge VSCode context to AI chat sites",
+  "publisher": "webaibridge",
+  "version": "0.0.1",
+  "categories": [
+    "Other"
+  ],
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "webaibridge.login",
+        "title": "WebAiBridge: Login"
+      },
+      {
+        "command": "webaibridge.sendSelection",
+        "title": "WebAiBridge: Send Selected Text"
+      },
+      {
+        "command": "webaibridge.sendFile",
+        "title": "WebAiBridge: Send Current File"
+      },
+      {
+        "command": "webaibridge.addSelectionToContext",
+        "title": "WebAiBridge: Add Selection to Context"
+      },
+      {
+        "command": "webaibridge.addFileToContext",
+        "title": "WebAiBridge: Add File to Context"
+      },
+      {
+        "command": "webaibridge.viewContext",
+        "title": "WebAiBridge: View Context Chips"
+      },
+      {
+        "command": "webaibridge.clearContext",
+        "title": "WebAiBridge: Clear Context"
+      },
+      {
+        "command": "webaibridge.sendContext",
+        "title": "WebAiBridge: Send All Context to Browser"
+      },
+      {
+        "command": "webaibridge.addFolderToContext",
+        "title": "WebAiBridge: Add Folder to Context"
+      }
+    ],
+    "configuration": {
+      "title": "WebAiBridge",
+      "properties": {
+        "webaibridge.excludePatterns": {
+          "type": "array",
+          "default": [
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/out/**",
+            "**/.next/**",
+            "**/coverage/**",
+            "**/__pycache__/**",
+            "**/*.pyc",
+            "**/venv/**",
+            "**/.venv/**",
+            "**/vendor/**",
+            "**/.idea/**",
+            "**/.vscode/**",
+            "**/bin/**",
+            "**/obj/**",
+            "**/*.min.js",
+            "**/*.min.css",
+            "**/*.map"
+          ],
+          "description": "Glob patterns to exclude files from being sent to AI chat. Follows .gitignore syntax."
+        },
+        "webaibridge.useGitignore": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also exclude files matching patterns in .gitignore"
+        },
+        "webaibridge.maxFileSize": {
+          "type": "number",
+          "default": 100000,
+          "description": "Maximum file size in bytes to include (files larger than this will be skipped)"
+        },
+        "webaibridge.maxFilesPerFolder": {
+          "type": "number",
+          "default": 50,
+          "description": "Maximum number of files to include when adding a folder to context"
+        },
+        "webaibridge.preferredModel": {
+          "type": "string",
+          "default": "gpt-4o",
+          "enum": [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4-turbo",
+            "gpt-4",
+            "gpt-4-32k",
+            "gpt-3.5-turbo",
+            "gpt-3.5-turbo-16k",
+            "claude-3.5-sonnet",
+            "claude-3-opus",
+            "claude-3-sonnet",
+            "claude-3-haiku",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+            "gemini-pro"
+          ],
+          "description": "Preferred AI model (affects token limits)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.70.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.13.0"
+  }
+}

@@ -1,0 +1,22 @@
+﻿{
+  "manifest_version": 3,
+  "name": "WebAiBridge - Prototype Web Ext",
+  "version": "0.0.1",
+  "description": "Prototype web extension to attach VSCode context to AI chat websites",
+  "permissions": ["scripting","activeTab","storage","tabs"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "WebAiBridge"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/tokenizer.js", "src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
