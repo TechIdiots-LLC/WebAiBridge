@@ -1,8 +1,8 @@
 ﻿{
-  "name": "webaibridge-web-prototype",
-  "version": "0.0.1",
+  "name": "webaibridge-chrome",
+  "version": "0.5.0",
   "license": "BSD-2-Clause",
-  "description": "Prototype web extension",
+  "description": "Chrome extension for WebAiBridge",
   "scripts": {
     "build": "echo 'No build step for prototype'"
   },

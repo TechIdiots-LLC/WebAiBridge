@@ -100,7 +100,9 @@ const Tokenizer = window.WebAiBridgeTokenizer || {
   isWarningLevel: (tokens) => tokens > 6500,
   exceedsLimit: (tokens) => tokens > 8192,
   getTokenInfo: (text) => ({ tokens: Math.ceil((text || '').length / 4), status: 'ok' }),
-  formatTokenCount: (n) => n.toString()
+  formatTokenCount: (n) => n.toString(),
+  truncateToLimit: (text, model, reserve) => text.substring(0, 30000),
+  chunkText: (text, maxTokens) => [{ text, tokens: Math.ceil(text.length / 4), partNumber: 1, totalParts: 1 }]
 };
 
 function estimateTokens(text) {
@@ -117,6 +119,264 @@ function isWarningLevel(tokens, model = 'default') {
 
 function exceedsLimit(tokens, model = 'default') {
   return Tokenizer.exceedsLimit(tokens, model);
+}
+
+// ==================== Limit Mode Handling ====================
+
+// Pending chunks for multi-part insertion
+let pendingChunks = [];
+let currentChunkIndex = 0;
+
+/**
+ * Apply per-message limit settings to text before insertion
+ * Returns: { action: 'insert'|'warn'|'chunk', text?: string, chunks?: array, tokens: number, limit: number }
+ */
+async function applyLimitMode(text) {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['messageLimit', 'limitMode', 'currentModel'], (res) => {
+      const customLimit = res?.messageLimit || 0;
+      const mode = res?.limitMode || 'warn';
+      const model = res?.currentModel || 'gpt-4';
+      
+      const modelLimit = Tokenizer.getLimit(model);
+      const effectiveLimit = customLimit > 0 ? Math.min(customLimit, modelLimit) : modelLimit;
+      const tokens = estimateTokens(text);
+      
+      console.debug(`Limit check: ${tokens} tokens, limit: ${effectiveLimit}, mode: ${mode}`);
+      
+      if (tokens <= effectiveLimit) {
+        // Under limit, just insert
+        resolve({ action: 'insert', text, tokens, limit: effectiveLimit });
+        return;
+      }
+      
+      // Over limit - apply mode
+      switch (mode) {
+        case 'truncate':
+          // Truncate to fit
+          const truncated = Tokenizer.truncateToLimit(text, model, 100);
+          resolve({ 
+            action: 'insert', 
+            text: truncated, 
+            tokens: estimateTokens(truncated), 
+            limit: effectiveLimit,
+            wasTruncated: true,
+            originalTokens: tokens
+          });
+          break;
+          
+        case 'chunk':
+          // Split into chunks
+          const chunks = Tokenizer.chunkText(text, effectiveLimit);
+          resolve({ 
+            action: 'chunk', 
+            chunks, 
+            tokens, 
+            limit: effectiveLimit 
+          });
+          break;
+          
+        case 'warn':
+        default:
+          // Warn user but allow insertion
+          resolve({ 
+            action: 'warn', 
+            text, 
+            tokens, 
+            limit: effectiveLimit 
+          });
+          break;
+      }
+    });
+  });
+}
+
+/**
+ * Show chunk navigation UI for multi-part content
+ */
+function showChunkNavigator(chunks, inputElement) {
+  pendingChunks = chunks;
+  currentChunkIndex = 0;
+  
+  // Remove existing navigator
+  const existing = document.getElementById('webaibridge-chunk-nav');
+  if (existing) existing.remove();
+  
+  const nav = document.createElement('div');
+  nav.id = 'webaibridge-chunk-nav';
+  nav.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: #1e1e1e;
+    border: 1px solid #3c3c3c;
+    border-radius: 8px;
+    padding: 12px 16px;
+    color: #d4d4d4;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    z-index: 2147483647;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    min-width: 280px;
+  `;
+  
+  function updateNavigator() {
+    const chunk = pendingChunks[currentChunkIndex];
+    nav.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <span style="font-weight:600;color:#4ec9b0">📋 Content Chunks</span>
+        <button id="chunk-close" style="background:none;border:none;color:#999;cursor:pointer;font-size:16px" title="Close">×</button>
+      </div>
+      <div style="margin-bottom:10px;color:#9cdcfe">
+        Part ${chunk.partNumber} of ${chunk.totalParts} 
+        <span style="color:#666">(~${Tokenizer.formatTokenCount(chunk.tokens)} tokens)</span>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <button id="chunk-prev" style="flex:1;padding:8px;border:1px solid #3c3c3c;background:#2d2d2d;color:#d4d4d4;border-radius:4px;cursor:pointer" ${currentChunkIndex === 0 ? 'disabled style="opacity:0.5"' : ''}>← Previous</button>
+        <button id="chunk-insert" style="flex:1;padding:8px;border:none;background:#0e639c;color:#fff;border-radius:4px;cursor:pointer;font-weight:500">Insert Part ${chunk.partNumber}</button>
+        <button id="chunk-next" style="flex:1;padding:8px;border:1px solid #3c3c3c;background:#2d2d2d;color:#d4d4d4;border-radius:4px;cursor:pointer" ${currentChunkIndex === chunks.length - 1 ? 'disabled style="opacity:0.5"' : ''}>Next →</button>
+      </div>
+      <div style="font-size:11px;color:#666">Insert each part and send before inserting the next</div>
+    `;
+    
+    // Attach event handlers
+    nav.querySelector('#chunk-close').onclick = () => {
+      nav.remove();
+      pendingChunks = [];
+    };
+    
+    nav.querySelector('#chunk-prev').onclick = () => {
+      if (currentChunkIndex > 0) {
+        currentChunkIndex--;
+        updateNavigator();
+      }
+    };
+    
+    nav.querySelector('#chunk-next').onclick = () => {
+      if (currentChunkIndex < pendingChunks.length - 1) {
+        currentChunkIndex++;
+        updateNavigator();
+      }
+    };
+    
+    nav.querySelector('#chunk-insert').onclick = () => {
+      const chunk = pendingChunks[currentChunkIndex];
+      const partHeader = `[Part ${chunk.partNumber}/${chunk.totalParts}]\n\n`;
+      
+      if (inputElement) {
+        inputElement.focus();
+        setTimeout(() => {
+          const success = insertTextDirect(partHeader + chunk.text);
+          if (success) {
+            // Auto-advance to next chunk
+            if (currentChunkIndex < pendingChunks.length - 1) {
+              currentChunkIndex++;
+              updateNavigator();
+              showNotification(`Part ${chunk.partNumber} inserted. Send it, then insert Part ${chunk.partNumber + 1}.`, 'info');
+            } else {
+              showNotification('All parts inserted!', 'success');
+              nav.remove();
+              pendingChunks = [];
+            }
+          }
+        }, 50);
+      }
+    };
+  }
+  
+  document.body.appendChild(nav);
+  updateNavigator();
+}
+
+/**
+ * Show limit warning dialog
+ */
+function showLimitWarning(tokens, limit, onProceed, onCancel) {
+  const dialog = document.createElement('div');
+  dialog.id = 'webaibridge-limit-warning';
+  dialog.style.cssText = `
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #1e1e1e;
+    border: 1px solid #f48771;
+    border-radius: 8px;
+    padding: 20px;
+    color: #d4d4d4;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    z-index: 2147483647;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+    max-width: 400px;
+  `;
+  
+  const percentage = Math.round((tokens / limit) * 100);
+  
+  dialog.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+      <span style="font-size:24px">⚠️</span>
+      <span style="font-weight:600;font-size:16px;color:#f48771">Content Exceeds Limit</span>
+    </div>
+    <div style="margin-bottom:16px;line-height:1.5">
+      <p style="margin:0 0 8px">This content is <strong>${Tokenizer.formatTokenCount(tokens)}</strong> tokens (${percentage}% of limit).</p>
+      <p style="margin:0;color:#9cdcfe">Limit: ${Tokenizer.formatTokenCount(limit)} tokens</p>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button id="limit-cancel" style="flex:1;padding:10px;border:1px solid #3c3c3c;background:#2d2d2d;color:#d4d4d4;border-radius:4px;cursor:pointer">Cancel</button>
+      <button id="limit-proceed" style="flex:1;padding:10px;border:none;background:#f48771;color:#1e1e1e;border-radius:4px;cursor:pointer;font-weight:500">Insert Anyway</button>
+    </div>
+  `;
+  
+  document.body.appendChild(dialog);
+  
+  dialog.querySelector('#limit-cancel').onclick = () => {
+    dialog.remove();
+    if (onCancel) onCancel();
+  };
+  
+  dialog.querySelector('#limit-proceed').onclick = () => {
+    dialog.remove();
+    if (onProceed) onProceed();
+  };
+}
+
+/**
+ * Show a notification toast
+ */
+function showNotification(message, type = 'info') {
+  const colors = {
+    info: { bg: '#1e3a5f', border: '#3c7fb6', color: '#9cdcfe' },
+    success: { bg: '#1e3a1e', border: '#3c8c3c', color: '#89d185' },
+    warning: { bg: '#5a4a1d', border: '#8b7a3a', color: '#dcdcaa' },
+    error: { bg: '#5a1d1d', border: '#8b3a3a', color: '#f48771' }
+  };
+  const c = colors[type] || colors.info;
+  
+  const notif = document.createElement('div');
+  notif.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: ${c.bg};
+    border: 1px solid ${c.border};
+    border-radius: 6px;
+    padding: 12px 20px;
+    color: ${c.color};
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    z-index: 2147483647;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    animation: webaibridge-fadeIn 0.2s ease-out;
+  `;
+  notif.textContent = message;
+  document.body.appendChild(notif);
+  
+  setTimeout(() => {
+    notif.style.opacity = '0';
+    notif.style.transition = 'opacity 0.3s';
+    setTimeout(() => notif.remove(), 300);
+  }, 4000);
 }
 
 // ==================== @ Mention Popover ====================
@@ -334,38 +594,134 @@ function selectMentionOption(optionId) {
   
   // Show loading indicator
   console.debug('Requesting context:', optionId);
+  showLoadingIndicator(savedInput);
   
   // Request the context from VS Code
   chrome.runtime.sendMessage({ 
     type: 'REQUEST_CONTEXT', 
     contextType: optionId 
-  }, (response) => {
+  }, async (response) => {
     console.debug('Context response:', response);
+    hideLoadingIndicator();
     
     if (chrome.runtime.lastError) {
       console.error('Chrome runtime error:', chrome.runtime.lastError);
+      showErrorNotification('Failed to get context: ' + chrome.runtime.lastError.message);
       return;
     }
     
     if (response?.text) {
-      // Focus the input and insert the context text
-      savedInput.focus();
+      // Apply limit mode handling
+      const limitResult = await applyLimitMode(response.text);
+      console.debug('Limit result:', limitResult);
       
-      // Small delay to ensure focus is established
-      setTimeout(() => {
-        const inserted = insertTextDirect(response.text);
-        if (!inserted) {
-          console.debug('Direct insert failed, trying fallback');
-          // Fallback: show in overlay
-          createOverlay(response.text, 'gpt-4');
-        }
-      }, 50);
+      switch (limitResult.action) {
+        case 'insert':
+          // Direct insert (possibly truncated)
+          savedInput.focus();
+          setTimeout(() => {
+            const inserted = insertTextDirect(limitResult.text);
+            if (!inserted) {
+              console.debug('Direct insert failed, trying fallback');
+              createOverlay(limitResult.text, 'gpt-4');
+            } else if (limitResult.wasTruncated) {
+              showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
+            }
+          }, 50);
+          break;
+          
+        case 'warn':
+          // Show warning dialog
+          showLimitWarning(
+            limitResult.tokens, 
+            limitResult.limit,
+            () => {
+              // User chose to proceed
+              savedInput.focus();
+              setTimeout(() => {
+                const inserted = insertTextDirect(limitResult.text);
+                if (!inserted) {
+                  createOverlay(limitResult.text, 'gpt-4');
+                }
+              }, 50);
+            },
+            () => {
+              // User cancelled - do nothing
+              console.debug('User cancelled insertion');
+            }
+          );
+          break;
+          
+        case 'chunk':
+          // Show chunk navigator
+          showChunkNavigator(limitResult.chunks, savedInput);
+          break;
+      }
     } else if (response?.error) {
       console.error('Context request failed:', response.error);
+      showErrorNotification('Context request failed: ' + response.error);
     } else {
       console.error('No response received from background');
+      showErrorNotification('No response from VS Code. Is the extension running?');
     }
   });
+}
+
+let loadingIndicator = null;
+
+function showLoadingIndicator(nearElement) {
+  hideLoadingIndicator();
+  loadingIndicator = document.createElement('div');
+  loadingIndicator.id = 'webaibridge-loading';
+  loadingIndicator.style.cssText = `
+    position: fixed;
+    background: #1e1e1e;
+    border: 1px solid #3c3c3c;
+    border-radius: 6px;
+    padding: 8px 16px;
+    color: #4ec9b0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    z-index: 2147483647;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  `;
+  loadingIndicator.innerHTML = '⏳ Fetching context from VS Code...';
+  
+  const rect = nearElement.getBoundingClientRect();
+  loadingIndicator.style.left = `${rect.left}px`;
+  loadingIndicator.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+  
+  document.body.appendChild(loadingIndicator);
+}
+
+function hideLoadingIndicator() {
+  if (loadingIndicator) {
+    loadingIndicator.remove();
+    loadingIndicator = null;
+  }
+}
+
+function showErrorNotification(message) {
+  const notif = document.createElement('div');
+  notif.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: #5a1d1d;
+    border: 1px solid #8b3a3a;
+    border-radius: 6px;
+    padding: 12px 16px;
+    color: #f48771;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    z-index: 2147483647;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    max-width: 300px;
+  `;
+  notif.textContent = message;
+  document.body.appendChild(notif);
+  
+  setTimeout(() => notif.remove(), 5000);
 }
 
 function removeAtQueryFromElement(element, startPos, query) {
@@ -1040,14 +1396,62 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const text = msg.text || '';
     const auto = !!msg.auto;
     const model = msg.model || 'gpt-4';
-    if (auto) {
-      const ok = insertTextDirect(text);
-      if (!ok) {
-        createOverlay(text, model);
+    
+    // Apply limit mode handling
+    applyLimitMode(text).then(limitResult => {
+      console.debug('INSERT_TEXT limit result:', limitResult);
+      
+      switch (limitResult.action) {
+        case 'insert':
+          // Direct insert (possibly truncated)
+          if (auto) {
+            const ok = insertTextDirect(limitResult.text);
+            if (!ok) {
+              createOverlay(limitResult.text, model);
+            } else if (limitResult.wasTruncated) {
+              showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
+            }
+          } else {
+            createOverlay(limitResult.text, model);
+            if (limitResult.wasTruncated) {
+              showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
+            }
+          }
+          break;
+          
+        case 'warn':
+          // Show warning dialog
+          const inputElement = lastFocusedInput || findChatInput();
+          showLimitWarning(
+            limitResult.tokens, 
+            limitResult.limit,
+            () => {
+              if (auto && inputElement) {
+                inputElement.focus();
+                setTimeout(() => {
+                  const ok = insertTextDirect(limitResult.text);
+                  if (!ok) {
+                    createOverlay(limitResult.text, model);
+                  }
+                }, 50);
+              } else {
+                createOverlay(limitResult.text, model);
+              }
+            },
+            () => {
+              console.debug('User cancelled chip insertion');
+            }
+          );
+          break;
+          
+        case 'chunk':
+          // Show chunk navigator
+          const chunkInput = lastFocusedInput || findChatInput();
+          showChunkNavigator(limitResult.chunks, chunkInput);
+          break;
       }
-    } else {
-      createOverlay(text, model);
-    }
+    });
+    
     sendResponse({ ok: true });
     return true;
   }

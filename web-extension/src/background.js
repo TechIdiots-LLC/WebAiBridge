@@ -12,8 +12,16 @@ let contextChips = [];
 // Pending @ mention context requests
 const pendingContextRequests = new Map();
 
-// Load saved model and chips on startup
-chrome.storage.local.get(['currentModel', 'contextChips'], (res) => {
+// Multi-instance support
+const PORT_START = 64923;
+const PORT_END = 64932;
+let discoveredInstances = []; // Array of { port, workspaceName, workspacePath }
+let selectedPort = PORT_START; // Currently selected instance port
+let ws = null;
+let reconnectTimer = null;
+
+// Load saved settings on startup
+chrome.storage.local.get(['currentModel', 'contextChips', 'selectedPort'], (res) => {
   if (res?.currentModel) {
     currentModel = res.currentModel;
     console.debug('Loaded model:', currentModel);
@@ -22,19 +30,92 @@ chrome.storage.local.get(['currentModel', 'contextChips'], (res) => {
     contextChips = res.contextChips;
     console.debug('Loaded chips:', contextChips.length);
   }
+  if (res?.selectedPort) {
+    selectedPort = res.selectedPort;
+    console.debug('Loaded selected port:', selectedPort);
+  }
 });
-
-const PORT = 64923;
-let ws = null;
-let reconnectTimer = null;
 
 function saveChips() {
   chrome.storage.local.set({ contextChips });
 }
 
-function connectBridge() {
+// Discover all running VS Code instances
+async function discoverInstances() {
+  const instances = [];
+  
+  for (let port = PORT_START; port <= PORT_END; port++) {
+    try {
+      const instance = await pingInstance(port);
+      if (instance) {
+        instances.push(instance);
+      }
+    } catch (e) {
+      // Port not available, skip
+    }
+  }
+  
+  discoveredInstances = instances;
+  chrome.storage.local.set({ discoveredInstances });
+  console.debug('Discovered instances:', instances);
+  return instances;
+}
+
+function pingInstance(port) {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      testWs.close();
+      resolve(null);
+    }, 1000);
+    
+    let testWs;
+    try {
+      testWs = new WebSocket(`ws://localhost:${port}`);
+    } catch (e) {
+      clearTimeout(timeout);
+      resolve(null);
+      return;
+    }
+    
+    testWs.onopen = () => {
+      testWs.send(JSON.stringify({ type: "PING" }));
+    };
+    
+    testWs.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data.type === "PONG") {
+          clearTimeout(timeout);
+          testWs.close();
+          resolve({
+            port: data.port || port,
+            workspaceName: data.workspaceName || 'Unknown',
+            workspacePath: data.workspacePath || ''
+          });
+        }
+      } catch (e) {
+        // Not a valid response
+      }
+    };
+    
+    testWs.onerror = () => {
+      clearTimeout(timeout);
+      resolve(null);
+    };
+    
+    testWs.onclose = () => {
+      clearTimeout(timeout);
+    };
+  });
+}
+
+function connectBridge(port = selectedPort) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.close();
+  }
+  
   try {
-    ws = new WebSocket(`ws://localhost:${PORT}`);
+    ws = new WebSocket(`ws://localhost:${port}`);
   } catch (e) {
     console.debug('WebSocket construction failed', e);
     scheduleReconnect();
@@ -42,7 +123,9 @@ function connectBridge() {
   }
 
   ws.onopen = () => {
-    console.debug('Connected to VSCode bridge');
+    console.debug('Connected to VSCode bridge on port', port);
+    selectedPort = port;
+    chrome.storage.local.set({ selectedPort });
     // Request current chips from VS Code
     ws.send(JSON.stringify({ type: "GET_CHIPS" }));
   };
@@ -51,6 +134,18 @@ function connectBridge() {
     try {
       const data = JSON.parse(ev.data);
       console.debug('Bridge message', data);
+      
+      // Handle instance info from VS Code
+      if (data.type === "INSTANCE_INFO") {
+        chrome.storage.local.set({ 
+          connectedInstance: {
+            port: data.port,
+            workspaceName: data.workspaceName,
+            workspacePath: data.workspacePath
+          }
+        });
+        return;
+      }
       
       // Handle chips list from VS Code
       if (data.type === "CHIPS_LIST") {
@@ -215,7 +310,7 @@ function formatChipsForInsert(chips, model = 'default', shouldTruncate = false) 
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; connectBridge(); }, 3000);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connectBridge(selectedPort); }, 3000);
 }
 
 // Keep service worker alive by pinging periodically
@@ -232,13 +327,23 @@ function startKeepAlive() {
     // Also check WebSocket connection
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.debug('Keep-alive: reconnecting bridge...');
-      connectBridge();
+      connectBridge(selectedPort);
     }
   }, 20000); // Every 20 seconds
 }
 
+// Discover instances on startup
+async function initializeConnection() {
+  const instances = await discoverInstances();
+  if (instances.length > 0) {
+    // Connect to the first instance or the previously selected one
+    const targetPort = instances.find(i => i.port === selectedPort)?.port || instances[0].port;
+    connectBridge(targetPort);
+  }
+}
+
 // Start connection and keep-alive on service worker startup
-connectBridge();
+initializeConnection();
 startKeepAlive();
 
 // Also reconnect when service worker wakes up from events
@@ -250,13 +355,39 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.runtime.onInstalled.addListener(() => {
   console.debug('Extension installed/updated, connecting bridge...');
-  connectBridge();
+  initializeConnection();
   startKeepAlive();
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "BRIDGE_STATUS") {
-    sendResponse({ connected: !!(ws && ws.readyState === WebSocket.OPEN) });
+    chrome.storage.local.get(['connectedInstance'], (res) => {
+      sendResponse({ 
+        connected: !!(ws && ws.readyState === WebSocket.OPEN),
+        connectedInstance: res?.connectedInstance || null,
+        selectedPort
+      });
+    });
+    return true;
+  }
+
+  // Discover all VS Code instances
+  if (msg?.type === "DISCOVER_INSTANCES") {
+    discoverInstances().then(instances => {
+      sendResponse({ instances });
+    });
+    return true;
+  }
+
+  // Switch to a different VS Code instance
+  if (msg?.type === "SWITCH_INSTANCE") {
+    const port = msg.port;
+    if (port >= PORT_START && port <= PORT_END) {
+      connectBridge(port);
+      sendResponse({ ok: true, port });
+    } else {
+      sendResponse({ ok: false, error: "Invalid port" });
+    }
     return true;
   }
 

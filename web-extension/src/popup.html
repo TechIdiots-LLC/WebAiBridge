@@ -11,6 +11,15 @@
       select{padding:4px;margin:4px 0;width:100%}
       .token-info{font-size:13px;margin:8px 0}
       
+      /* Instance picker styles */
+      .instance-section{margin:8px 0;padding:8px;border:1px solid #ddd;border-radius:6px;background:#f9f9f9}
+      .instance-header{display:flex;justify-content:space-between;align-items:center}
+      .instance-header label{font-weight:500;font-size:13px}
+      .instance-refresh{background:none;border:none;cursor:pointer;font-size:14px;padding:2px 6px}
+      .instance-refresh:hover{background:#eee;border-radius:4px}
+      #instanceSelect{margin-top:4px}
+      .no-instances{color:#999;font-style:italic;font-size:12px;padding:4px 0}
+      
       /* Chip styles */
       .chips-section{margin:12px 0;border:1px solid #ddd;border-radius:6px;padding:8px}
       .chips-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
@@ -37,6 +46,17 @@
   <body>
     <h3>WebAiBridge</h3>
     <div id="status">Not connected</div>
+    
+    <!-- Instance Picker -->
+    <div class="instance-section">
+      <div class="instance-header">
+        <label for="instanceSelect">VS Code Instance:</label>
+        <button class="instance-refresh" id="refreshInstances" title="Refresh instances">🔄</button>
+      </div>
+      <select id="instanceSelect">
+        <option value="">Searching...</option>
+      </select>
+    </div>
     
     <div style="margin:8px 0">
       <label for="modelSelect">Model:</label>
@@ -87,6 +107,30 @@
       <div id="tokenWarning" style="display:none"></div>
     </div>
     
+    <!-- Per-message limit settings -->
+    <div class="instance-section" style="margin-top:8px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <label for="messageLimit" style="font-size:13px;font-weight:500">Per-message limit:</label>
+        <input type="number" id="messageLimit" min="0" max="200000" step="1000" style="width:80px;padding:4px" placeholder="0">
+        <span style="font-size:11px;color:#666">tokens</span>
+      </div>
+      <div style="font-size:11px;color:#666;margin-bottom:6px">Set to 0 for no limit (uses model limit)</div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="radio" name="limitMode" id="limitModeWarn" value="warn" checked>
+          <span>⚠️ Warn when over limit</span>
+        </label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="radio" name="limitMode" id="limitModeChunk" value="chunk">
+          <span>✂️ Auto-chunk into parts</span>
+        </label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="radio" name="limitMode" id="limitModeTruncate" value="truncate">
+          <span>📏 Truncate to fit</span>
+        </label>
+      </div>
+    </div>
+
     <div style="margin:6px 0;align-items:center">
       <label><input type="checkbox" id="autoInsert"> Auto-insert into focused field</input></label>
     </div>

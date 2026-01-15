@@ -14,11 +14,46 @@ function formatTokenCount(n) {
   return Tokenizer.formatTokenCount ? Tokenizer.formatTokenCount(n) : n.toString();
 }
 
+// Instance discovery and switching
+let currentInstances = [];
+
+function updateInstances() {
+  const select = document.getElementById('instanceSelect');
+  select.innerHTML = '<option value="">Searching...</option>';
+  
+  chrome.runtime.sendMessage({ type: "DISCOVER_INSTANCES" }, (resp) => {
+    currentInstances = resp?.instances || [];
+    
+    if (currentInstances.length === 0) {
+      select.innerHTML = '<option value="">No VS Code instances found</option>';
+      return;
+    }
+    
+    // Get currently connected instance
+    chrome.runtime.sendMessage({ type: "BRIDGE_STATUS" }, (statusResp) => {
+      const selectedPort = statusResp?.selectedPort;
+      
+      select.innerHTML = '';
+      currentInstances.forEach(inst => {
+        const opt = document.createElement('option');
+        opt.value = inst.port;
+        opt.textContent = `${inst.workspaceName} (port ${inst.port})`;
+        opt.title = inst.workspacePath;
+        if (inst.port === selectedPort) {
+          opt.selected = true;
+        }
+        select.appendChild(opt);
+      });
+    });
+  });
+}
+
 function updateBridgeStatus() {
   chrome.runtime.sendMessage({ type: "BRIDGE_STATUS" }, (resp) => {
     const s = document.getElementById("status");
     if (resp?.connected) {
-      s.textContent = "✓ Connected to VS Code";
+      const instanceName = resp?.connectedInstance?.workspaceName || 'VS Code';
+      s.textContent = `✓ Connected to ${instanceName}`;
       s.style.color = "#28a745";
     } else {
       s.textContent = "✗ Not connected to VS Code";
@@ -159,6 +194,34 @@ document.getElementById('modelSelect').addEventListener('change', (e) => {
   updateStats();
 });
 
+// Per-message limit settings
+document.getElementById('messageLimit').addEventListener('change', (e) => {
+  const limit = parseInt(e.target.value, 10) || 0;
+  chrome.storage.local.set({ messageLimit: limit });
+});
+
+document.querySelectorAll('input[name="limitMode"]').forEach(radio => {
+  radio.addEventListener('change', (e) => {
+    if (e.target.checked) {
+      chrome.storage.local.set({ limitMode: e.target.value });
+    }
+  });
+});
+
+// Load message limit settings
+function loadLimitSettings() {
+  chrome.storage.local.get(['messageLimit', 'limitMode'], (res) => {
+    const limit = res?.messageLimit || 0;
+    const mode = res?.limitMode || 'warn';
+    
+    document.getElementById('messageLimit').value = limit || '';
+    
+    document.querySelectorAll('input[name="limitMode"]').forEach(radio => {
+      radio.checked = radio.value === mode;
+    });
+  });
+}
+
 // Chip action buttons
 document.getElementById('insertAllChips').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: "INSERT_CHIPS" }, (resp) => {
@@ -176,6 +239,23 @@ document.getElementById('clearChips').addEventListener('click', () => {
   }
 });
 
+// Instance picker
+document.getElementById('instanceSelect').addEventListener('change', (e) => {
+  const port = parseInt(e.target.value, 10);
+  if (port) {
+    chrome.runtime.sendMessage({ type: "SWITCH_INSTANCE", port }, (resp) => {
+      if (resp?.ok) {
+        updateBridgeStatus();
+        updateChips(); // Chips will be different for each instance
+      }
+    });
+  }
+});
+
+document.getElementById('refreshInstances').addEventListener('click', () => {
+  updateInstances();
+});
+
 // Listen for storage changes to update chips in real-time
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.contextChips) {
@@ -185,8 +265,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 // Initial load
 updateBridgeStatus();
+updateInstances();
 updateChips();
 updateStats();
+loadLimitSettings();
 
 // Periodic refresh
 setInterval(() => { 

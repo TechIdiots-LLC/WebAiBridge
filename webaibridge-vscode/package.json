@@ -3,11 +3,11 @@
   "displayName": "WebAiBridge",
   "description": "Bridge VS Code context to AI chat sites like ChatGPT, Claude, Gemini, and more",
   "publisher": "webaibridge",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "license": "BSD-2-Clause",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Andrew/WebAiBridge"
+    "url": "https://github.com/TechIdiots-LLC/WebAiBridge"
   },
   "categories": [
     "Other",

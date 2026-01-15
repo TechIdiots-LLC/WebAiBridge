@@ -82,6 +82,36 @@ This document lists the goals, planned steps, feature list, and current status f
 - Optimize prompt formatting and chunking for different LLM providers.
 - Add telemetry/diagnostics (opt-in) and unit/integration tests.
 
+## Long-term / Future Ideas
+
+### ~~Per-Message Token Limits~~ ✅ Implemented
+- ~~Track per-message limits separately from context window limits.~~
+- ✅ User-configurable per-message limit in popup settings
+- ✅ Three modes: Warn, Auto-chunk, or Truncate
+- ✅ Applied to @ mentions and chip insertions
+
+### ~~Smart Chunking for Large Content~~ ✅ Implemented
+- ✅ When content exceeds message limits, automatically split into logical chunks
+- ✅ Chunks split at natural boundaries (paragraphs, newlines, sentences)
+- ✅ Chunk navigator UI with Part X/Y labels
+- ✅ Insert chunks one at a time, send, then insert next
+- Future enhancements:
+  - Multi-part message header to explain chunking to AI
+  - By-file chunking option
+  - Semantic boundary detection (function/class definitions)
+  - Auto-send queue with delays
+
+### VS Code Chat Panel
+- Implement a WebView-based chat panel inside VS Code.
+- Features:
+  - Send messages to the connected AI chat site without leaving VS Code.
+  - See AI responses rendered with syntax highlighting.
+  - Apply code blocks directly to files with one click.
+  - Keep conversation history per workspace.
+  - Support for multiple concurrent conversations.
+- Bridge approach: Route messages through the existing WebSocket to the browser, capture responses back.
+- Alternative: Direct API integration with AI providers (requires API keys but removes browser dependency).
+
 ## How to run the prototype locally
 1. Open the repo folder in VSCode:
 

@@ -70,13 +70,58 @@ export function activate(context: vscode.ExtensionContext) {
   vscode.window.showInformationMessage("WebAiBridge extension activated!");
   console.log("WebAiBridge prototype activated");
 
-  const PORT = 64923;
+  const PORT_START = 64923;
+  const PORT_END = 64932; // Try up to 10 ports
   let wss: any;
+  let actualPort: number = 0;
   const clients = new Set<any>();
+  
+  // Get workspace name for identification
+  const workspaceName = vscode.workspace.workspaceFolders?.[0]?.name || 'Untitled Workspace';
+  const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
 
-  try {
-    wss = new WebSocketServer({ port: PORT });
-    console.log(`WebAiBridge bridge listening on ws://localhost:${PORT}`);
+  // Try to find an available port
+  function tryStartServer(port: number): Promise<number> {
+    return new Promise((resolve, reject) => {
+      try {
+        const server = new WebSocketServer({ port });
+        server.on('error', (err: any) => {
+          if (err.code === 'EADDRINUSE') {
+            reject(err);
+          } else {
+            reject(err);
+          }
+        });
+        server.on('listening', () => {
+          wss = server;
+          resolve(port);
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  async function startServer() {
+    for (let port = PORT_START; port <= PORT_END; port++) {
+      try {
+        actualPort = await tryStartServer(port);
+        console.log(`WebAiBridge bridge listening on ws://localhost:${actualPort}`);
+        vscode.window.showInformationMessage(`WebAiBridge connected on port ${actualPort}`);
+        setupWebSocketHandlers();
+        return;
+      } catch (err: any) {
+        if (err.code === 'EADDRINUSE') {
+          console.log(`Port ${port} in use, trying next...`);
+          continue;
+        }
+        console.error(`Failed to start on port ${port}:`, err);
+      }
+    }
+    vscode.window.showErrorMessage('WebAiBridge: Could not find an available port (64923-64932)');
+  }
+
+  function setupWebSocketHandlers() {
     wss.on("connection", (ws: any) => {
       console.log("Bridge client connected");
       clients.add(ws);
@@ -84,6 +129,18 @@ export function activate(context: vscode.ExtensionContext) {
         try {
           const data = JSON.parse(msg.toString());
           console.log("Received from bridge client:", data);
+          
+          // Handle PING request for instance discovery
+          if (data.type === "PING") {
+            ws.send(JSON.stringify({ 
+              type: "PONG", 
+              port: actualPort,
+              workspaceName,
+              workspacePath,
+              instanceId: `${actualPort}-${Date.now()}`
+            }));
+            return;
+          }
           
           // Handle requests from web extension
           if (data.type === "GET_CHIPS") {
@@ -120,13 +177,20 @@ export function activate(context: vscode.ExtensionContext) {
       });
       ws.on("close", () => clients.delete(ws));
       
-      // Send current chips when client connects
+      // Send current chips and workspace info when client connects
       const chips = context.workspaceState.get<ContextChip[]>('contextChips', []);
       ws.send(JSON.stringify({ type: "CHIPS_LIST", chips }));
+      ws.send(JSON.stringify({ 
+        type: "INSTANCE_INFO", 
+        port: actualPort,
+        workspaceName,
+        workspacePath
+      }));
     });
-  } catch (err) {
-    console.error("Failed to start WebSocketServer", err);
   }
+  
+  // Start the server
+  startServer();
 
   // Handle AI responses received from browser
   async function handleAIResponse(data: { text: string; isCode?: boolean; site?: string }) {

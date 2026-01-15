@@ -269,6 +269,111 @@ function formatTokenCount(tokens) {
 }
 
 /**
+ * Split text into chunks that fit within a token limit
+ * Tries to split at natural boundaries (newlines, paragraphs)
+ * @param {string} text - The text to chunk
+ * @param {number} maxTokensPerChunk - Maximum tokens per chunk
+ * @param {number} overlapTokens - Tokens to overlap between chunks (for context)
+ * @returns {Array<{text: string, tokens: number, partNumber: number, totalParts: number}>}
+ */
+function chunkText(text, maxTokensPerChunk, overlapTokens = 0) {
+  if (!text) return [];
+  
+  const totalTokens = estimateTokens(text);
+  
+  // If fits in one chunk, return as-is
+  if (totalTokens <= maxTokensPerChunk) {
+    return [{ text, tokens: totalTokens, partNumber: 1, totalParts: 1 }];
+  }
+  
+  const chunks = [];
+  let remaining = text;
+  let partNumber = 1;
+  
+  // Reserve tokens for part header like "[Part 1/3]\n"
+  const headerReserve = 20;
+  const effectiveLimit = maxTokensPerChunk - headerReserve;
+  
+  while (remaining.length > 0) {
+    let chunkText;
+    const remainingTokens = estimateTokens(remaining);
+    
+    if (remainingTokens <= effectiveLimit) {
+      // Last chunk
+      chunkText = remaining;
+      remaining = '';
+    } else {
+      // Find a good split point
+      // Start by estimating character position based on token ratio
+      const ratio = effectiveLimit / remainingTokens;
+      let splitPos = Math.floor(remaining.length * ratio);
+      
+      // Try to find a natural break point (paragraph, line, sentence)
+      const searchRange = Math.min(500, Math.floor(splitPos * 0.2));
+      const searchStart = Math.max(0, splitPos - searchRange);
+      const searchEnd = Math.min(remaining.length, splitPos + searchRange);
+      const searchArea = remaining.substring(searchStart, searchEnd);
+      
+      // Prefer paragraph breaks (double newline)
+      let breakIdx = searchArea.lastIndexOf('\n\n');
+      if (breakIdx === -1) {
+        // Try single newline
+        breakIdx = searchArea.lastIndexOf('\n');
+      }
+      if (breakIdx === -1) {
+        // Try sentence end
+        const sentenceMatch = searchArea.match(/[.!?]\s+(?=[A-Z])/g);
+        if (sentenceMatch) {
+          breakIdx = searchArea.lastIndexOf(sentenceMatch[sentenceMatch.length - 1]);
+        }
+      }
+      if (breakIdx === -1) {
+        // Try space
+        breakIdx = searchArea.lastIndexOf(' ');
+      }
+      
+      if (breakIdx !== -1) {
+        splitPos = searchStart + breakIdx + 1;
+      }
+      
+      // Verify the chunk fits, if not reduce
+      chunkText = remaining.substring(0, splitPos);
+      while (estimateTokens(chunkText) > effectiveLimit && splitPos > 100) {
+        splitPos = Math.floor(splitPos * 0.9);
+        const searchSub = remaining.substring(0, splitPos);
+        const lastBreak = searchSub.lastIndexOf('\n');
+        splitPos = lastBreak > 0 ? lastBreak + 1 : splitPos;
+        chunkText = remaining.substring(0, splitPos);
+      }
+      
+      remaining = remaining.substring(splitPos).trimStart();
+      
+      // Add overlap from end of chunk to start of next chunk
+      if (overlapTokens > 0 && remaining.length > 0) {
+        // Find overlap text from end of current chunk
+        const overlapChars = Math.floor(chunkText.length * (overlapTokens / estimateTokens(chunkText)));
+        const overlap = chunkText.substring(chunkText.length - overlapChars);
+        remaining = overlap + remaining;
+      }
+    }
+    
+    chunks.push({
+      text: chunkText.trim(),
+      tokens: estimateTokens(chunkText),
+      partNumber,
+      totalParts: 0 // Will be filled in after
+    });
+    partNumber++;
+  }
+  
+  // Fill in totalParts
+  const totalParts = chunks.length;
+  chunks.forEach(c => c.totalParts = totalParts);
+  
+  return chunks;
+}
+
+/**
  * Get list of available models
  */
 function getAvailableModels() {
@@ -284,6 +389,7 @@ if (typeof window !== 'undefined') {
     getWarningThreshold,
     getLimit,
     truncateToLimit,
+    chunkText,
     isWarningLevel,
     getTokenInfo,
     formatTokenCount,
@@ -301,6 +407,7 @@ if (typeof module !== 'undefined' && module.exports) {
     getWarningThreshold,
     getLimit,
     truncateToLimit,
+    chunkText,
     isWarningLevel,
     getTokenInfo,
     formatTokenCount,
