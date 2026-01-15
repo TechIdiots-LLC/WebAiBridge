@@ -1,11 +1,17 @@
 {
-  "name": "webaibridge-vscode-prototype",
-  "displayName": "WebAiBridge (Prototype)",
-  "description": "Bridge VSCode context to AI chat sites",
+  "name": "webaibridge",
+  "displayName": "WebAiBridge",
+  "description": "Bridge VS Code context to AI chat sites like ChatGPT, Claude, Gemini, and more",
   "publisher": "webaibridge",
-  "version": "0.0.1",
+  "version": "0.2.0",
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Andrew/WebAiBridge"
+  },
   "categories": [
-    "Other"
+    "Other",
+    "Machine Learning"
   ],
   "engines": {
     "vscode": "^1.70.0"
@@ -53,6 +59,64 @@
         "title": "WebAiBridge: Add Folder to Context"
       }
     ],
+    "submenus": [
+      {
+        "id": "webaibridge.submenu",
+        "label": "WebAiBridge"
+      }
+    ],
+    "menus": {
+      "webaibridge.submenu": [
+        {
+          "command": "webaibridge.sendSelection",
+          "when": "editorHasSelection",
+          "group": "1_send@1"
+        },
+        {
+          "command": "webaibridge.sendFile",
+          "group": "1_send@2"
+        },
+        {
+          "command": "webaibridge.addSelectionToContext",
+          "when": "editorHasSelection",
+          "group": "2_context@1"
+        },
+        {
+          "command": "webaibridge.addFileToContext",
+          "group": "2_context@2"
+        },
+        {
+          "command": "webaibridge.sendContext",
+          "group": "3_actions@1"
+        },
+        {
+          "command": "webaibridge.viewContext",
+          "group": "3_actions@2"
+        },
+        {
+          "command": "webaibridge.clearContext",
+          "group": "3_actions@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "submenu": "webaibridge.submenu",
+          "group": "z_webaibridge"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "webaibridge.addFileToContext",
+          "when": "!explorerResourceIsFolder",
+          "group": "z_webaibridge@1"
+        },
+        {
+          "command": "webaibridge.addFolderToContext",
+          "when": "explorerResourceIsFolder",
+          "group": "z_webaibridge@1"
+        }
+      ]
+    },
     "configuration": {
       "title": "WebAiBridge",
       "properties": {
@@ -129,6 +193,7 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.70.0",
+    "@types/ws": "^8.5.10",
     "typescript": "^5.0.0"
   },
   "dependencies": {

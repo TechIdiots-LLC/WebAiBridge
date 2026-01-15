@@ -271,17 +271,31 @@ export function activate(context: vscode.ExtensionContext) {
     addChip(chip);
   });
 
-  const addFileToContext = vscode.commands.registerCommand("webaibridge.addFileToContext", async () => {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return vscode.window.showWarningMessage("No active editor");
+  const addFileToContext = vscode.commands.registerCommand("webaibridge.addFileToContext", async (uri?: vscode.Uri) => {
+    let filePath: string;
+    let text: string;
+    let languageId: string;
     
-    const doc = editor.document;
-    const filename = path.basename(doc.fileName);
+    if (uri) {
+      // Called from explorer context menu
+      filePath = uri.fsPath;
+      const doc = await vscode.workspace.openTextDocument(uri);
+      text = doc.getText();
+      languageId = doc.languageId;
+    } else {
+      // Called from command palette or editor context
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return vscode.window.showWarningMessage("No active editor");
+      filePath = editor.document.fileName;
+      text = editor.document.getText();
+      languageId = editor.document.languageId;
+    }
+    
+    const filename = path.basename(filePath);
     
     // Check file size
     const config = vscode.workspace.getConfiguration('webaibridge');
     const maxFileSize = config.get<number>('maxFileSize', 100000);
-    const text = doc.getText();
     
     if (text.length > maxFileSize) {
       const action = await vscode.window.showWarningMessage(
@@ -302,7 +316,7 @@ export function activate(context: vscode.ExtensionContext) {
       allPatterns = [...allPatterns, ...gitignorePatterns];
     }
     
-    if (workspaceRoot && shouldExclude(doc.fileName, allPatterns, workspaceRoot)) {
+    if (workspaceRoot && shouldExclude(filePath, allPatterns, workspaceRoot)) {
       const action = await vscode.window.showWarningMessage(
         `File matches an exclude pattern. Add anyway?`,
         'Add Anyway', 'Cancel'
@@ -315,8 +329,8 @@ export function activate(context: vscode.ExtensionContext) {
       type: 'file',
       label: filename,
       text,
-      languageId: doc.languageId,
-      filePath: doc.fileName,
+      languageId: languageId,
+      filePath: filePath,
       timestamp: Date.now()
     };
     
@@ -324,24 +338,31 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   // Add folder to context - recursively add files from a folder
-  const addFolderToContext = vscode.commands.registerCommand("webaibridge.addFolderToContext", async () => {
+  const addFolderToContext = vscode.commands.registerCommand("webaibridge.addFolderToContext", async (uri?: vscode.Uri) => {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceRoot) {
       return vscode.window.showWarningMessage("No workspace folder open");
     }
     
-    // Let user pick a folder
-    const folderUri = await vscode.window.showOpenDialog({
-      canSelectFiles: false,
-      canSelectFolders: true,
-      canSelectMany: false,
-      defaultUri: vscode.Uri.file(workspaceRoot),
-      openLabel: 'Add Folder to Context'
-    });
+    let folderPath: string;
     
-    if (!folderUri || folderUri.length === 0) return;
+    if (uri) {
+      // Called from explorer context menu
+      folderPath = uri.fsPath;
+    } else {
+      // Let user pick a folder
+      const folderUri = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        defaultUri: vscode.Uri.file(workspaceRoot),
+        openLabel: 'Add Folder to Context'
+      });
+      
+      if (!folderUri || folderUri.length === 0) return;
+      folderPath = folderUri[0].fsPath;
+    }
     
-    const folderPath = folderUri[0].fsPath;
     const folderName = path.basename(folderPath);
     
     const config = vscode.workspace.getConfiguration('webaibridge');

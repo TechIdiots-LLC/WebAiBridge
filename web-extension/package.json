@@ -1,6 +1,7 @@
 ﻿{
   "name": "webaibridge-web-prototype",
   "version": "0.0.1",
+  "license": "BSD-2-Clause",
   "description": "Prototype web extension",
   "scripts": {
     "build": "echo 'No build step for prototype'"
