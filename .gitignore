@@ -3,3 +3,7 @@ out/
 dist/
 .vscode/
 *.log
+
+# Build artifacts
+*.vsix
+*.zip
