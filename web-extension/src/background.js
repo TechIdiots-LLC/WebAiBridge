@@ -9,6 +9,9 @@ let currentModel = 'gpt-4';
 // Context chips received from VS Code
 let contextChips = [];
 
+// Pending @ mention context requests
+const pendingContextRequests = new Map();
+
 // Load saved model and chips on startup
 chrome.storage.local.get(['currentModel', 'contextChips'], (res) => {
   if (res?.currentModel) {
@@ -60,6 +63,29 @@ function connectBridge() {
           totalChipTokens: totalTokens,
           chipCount: contextChips.length
         });
+        return;
+      }
+      
+      // Handle @ mention context response from VS Code
+      if (data.type === "CONTEXT_RESPONSE") {
+        console.debug('CONTEXT_RESPONSE received:', data.requestId, data.text?.length, 'chars');
+        const callback = pendingContextRequests.get(data.requestId);
+        if (callback) {
+          pendingContextRequests.delete(data.requestId);
+          callback({ text: data.text, tokens: data.tokens });
+        } else {
+          console.debug('No pending callback for requestId:', data.requestId);
+        }
+        return;
+      }
+      
+      // Handle @ mention context info response from VS Code
+      if (data.type === "CONTEXT_INFO_RESPONSE") {
+        const callback = pendingContextRequests.get(data.requestId);
+        if (callback) {
+          pendingContextRequests.delete(data.requestId);
+          callback({ contextInfo: data.contextInfo });
+        }
         return;
       }
       
@@ -332,6 +358,71 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     
     sendResponse({ ok: true });
+    return true;
+  }
+
+  // @ Mention: Request context from VS Code
+  if (msg?.type === "REQUEST_CONTEXT") {
+    console.debug('REQUEST_CONTEXT received:', msg.contextType);
+    
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.debug('WebSocket not connected');
+      sendResponse({ error: "Not connected to VS Code" });
+      return true;
+    }
+    
+    // Create a unique request ID
+    const requestId = `ctx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    console.debug('Sending GET_CONTEXT to VS Code with requestId:', requestId);
+    
+    // Store the callback for when response arrives
+    pendingContextRequests.set(requestId, (response) => {
+      console.debug('Calling stored callback with response:', response?.text?.length, 'chars');
+      sendResponse(response);
+    });
+    
+    ws.send(JSON.stringify({
+      type: "GET_CONTEXT",
+      contextType: msg.contextType,
+      requestId: requestId
+    }));
+    
+    // Timeout after 10 seconds
+    setTimeout(() => {
+      if (pendingContextRequests.has(requestId)) {
+        console.debug('Request timed out:', requestId);
+        const callback = pendingContextRequests.get(requestId);
+        pendingContextRequests.delete(requestId);
+        callback({ error: "Request timed out" });
+      }
+    }, 10000);
+    
+    return true; // Will respond asynchronously
+  }
+
+  // @ Mention: Get context info (token counts) from VS Code
+  if (msg?.type === "GET_CONTEXT_INFO") {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      sendResponse({ error: "Not connected to VS Code" });
+      return true;
+    }
+    
+    const requestId = `info_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    pendingContextRequests.set(requestId, sendResponse);
+    
+    ws.send(JSON.stringify({
+      type: "GET_CONTEXT_INFO",
+      requestId: requestId
+    }));
+    
+    setTimeout(() => {
+      if (pendingContextRequests.has(requestId)) {
+        const callback = pendingContextRequests.get(requestId);
+        pendingContextRequests.delete(requestId);
+        callback({ contextInfo: {} });
+      }
+    }, 5000);
+    
     return true;
   }
 });

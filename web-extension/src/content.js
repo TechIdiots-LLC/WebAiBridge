@@ -3,6 +3,24 @@
 // Track the last focused input field before overlay appears
 let lastFocusedInput = null;
 
+// @ mention popover state
+let mentionPopover = null;
+let mentionQuery = '';
+let mentionStartPos = -1;
+let selectedMentionIndex = 0;
+
+// Available @ mention options
+const mentionOptions = [
+  { id: 'focused-file', icon: '📄', label: 'Focused File', description: 'Currently open file in VS Code', tokens: null },
+  { id: 'selection', icon: '✂️', label: 'Selected Text', description: 'Current selection in VS Code', tokens: null },
+  { id: 'visible-editors', icon: '📑', label: 'Visible Editors', description: 'All visible editor contents', tokens: null },
+  { id: 'open-tabs', icon: '📂', label: 'All Open Tabs', description: 'Content from all open files', tokens: null },
+  { id: 'problems', icon: '⚠️', label: 'Problems', description: 'Errors and warnings from VS Code', tokens: null },
+  { id: 'file-tree', icon: '🌲', label: 'File Tree', description: 'Workspace folder structure', tokens: null },
+  { id: 'git-diff', icon: '📝', label: 'Git Changes', description: 'Uncommitted changes', tokens: null },
+  { id: 'terminal', icon: '💻', label: 'Terminal Output', description: 'Recent terminal output', tokens: null },
+];
+
 // Detect which AI chat site we're on
 function detectSite() {
   const host = location.hostname;
@@ -100,6 +118,416 @@ function isWarningLevel(tokens, model = 'default') {
 function exceedsLimit(tokens, model = 'default') {
   return Tokenizer.exceedsLimit(tokens, model);
 }
+
+// ==================== @ Mention Popover ====================
+
+function createMentionPopover(inputElement) {
+  removeMentionPopover();
+  
+  mentionPopover = document.createElement('div');
+  mentionPopover.id = 'webaibridge-mention-popover';
+  mentionPopover.style.cssText = `
+    position: fixed;
+    background: #1e1e1e;
+    border: 1px solid #3c3c3c;
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    z-index: 2147483647;
+    min-width: 280px;
+    max-width: 360px;
+    max-height: 400px;
+    overflow-y: auto;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    color: #cccccc;
+    padding: 4px 0;
+  `;
+  
+  // Position near the caret
+  const rect = getCaretPosition(inputElement);
+  if (rect) {
+    mentionPopover.style.left = `${rect.left}px`;
+    mentionPopover.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+  } else {
+    // Fallback positioning
+    const inputRect = inputElement.getBoundingClientRect();
+    mentionPopover.style.left = `${inputRect.left}px`;
+    mentionPopover.style.bottom = `${window.innerHeight - inputRect.top + 8}px`;
+  }
+  
+  // Header
+  const header = document.createElement('div');
+  header.style.cssText = `
+    padding: 8px 12px 6px;
+    font-size: 11px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid #3c3c3c;
+    margin-bottom: 4px;
+  `;
+  header.textContent = 'Add Context from VS Code (@ or #)';
+  mentionPopover.appendChild(header);
+  
+  updateMentionOptions();
+  document.body.appendChild(mentionPopover);
+  
+  // Request token counts from VS Code
+  requestContextInfo();
+}
+
+function updateMentionOptions() {
+  if (!mentionPopover) return;
+  
+  // Remove existing options (keep header)
+  const header = mentionPopover.firstChild;
+  mentionPopover.innerHTML = '';
+  mentionPopover.appendChild(header);
+  
+  // Filter options based on query
+  const query = mentionQuery.toLowerCase();
+  const filtered = mentionOptions.filter(opt => 
+    opt.label.toLowerCase().includes(query) || 
+    opt.description.toLowerCase().includes(query)
+  );
+  
+  if (filtered.length === 0) {
+    const noResults = document.createElement('div');
+    noResults.style.cssText = 'padding: 12px; color: #888; text-align: center;';
+    noResults.textContent = 'No matching context options';
+    mentionPopover.appendChild(noResults);
+    return;
+  }
+  
+  selectedMentionIndex = Math.min(selectedMentionIndex, filtered.length - 1);
+  
+  filtered.forEach((opt, index) => {
+    const item = document.createElement('div');
+    item.className = 'webaibridge-mention-item';
+    item.dataset.id = opt.id;
+    item.style.cssText = `
+      display: flex;
+      align-items: center;
+      padding: 8px 12px;
+      cursor: pointer;
+      transition: background 0.1s;
+      ${index === selectedMentionIndex ? 'background: #094771;' : ''}
+    `;
+    
+    item.innerHTML = `
+      <span style="font-size: 16px; margin-right: 10px; width: 24px; text-align: center;">${opt.icon}</span>
+      <div style="flex: 1; min-width: 0;">
+        <div style="font-weight: 500; color: #e0e0e0;">${highlightMatch(opt.label, query)}</div>
+        <div style="font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${opt.description}</div>
+      </div>
+      ${opt.tokens !== null ? `<span style="font-size: 11px; color: #4ec9b0; margin-left: 8px; font-weight: 600;">${formatTokens(opt.tokens)}</span>` : ''}
+    `;
+    
+    item.addEventListener('mouseenter', () => {
+      selectedMentionIndex = index;
+      updateMentionSelection();
+    });
+    
+    item.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      selectMentionOption(opt.id);
+    });
+    
+    mentionPopover.appendChild(item);
+  });
+}
+
+function highlightMatch(text, query) {
+  if (!query) return text;
+  const idx = text.toLowerCase().indexOf(query);
+  if (idx === -1) return text;
+  return text.slice(0, idx) + '<span style="color:#4ec9b0;">' + text.slice(idx, idx + query.length) + '</span>' + text.slice(idx + query.length);
+}
+
+function formatTokens(tokens) {
+  if (tokens >= 1000) {
+    return (tokens / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+  }
+  return tokens.toString();
+}
+
+function updateMentionSelection() {
+  if (!mentionPopover) return;
+  const items = mentionPopover.querySelectorAll('.webaibridge-mention-item');
+  items.forEach((item, idx) => {
+    item.style.background = idx === selectedMentionIndex ? '#094771' : '';
+  });
+}
+
+function removeMentionPopover() {
+  if (mentionPopover) {
+    mentionPopover.remove();
+    mentionPopover = null;
+  }
+  mentionQuery = '';
+  mentionStartPos = -1;
+  selectedMentionIndex = 0;
+}
+
+function getCaretPosition(element) {
+  try {
+    if (element.isContentEditable) {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0).cloneRange();
+        range.collapse(true);
+        const rect = range.getClientRects()[0];
+        if (rect) return rect;
+      }
+    } else if ('selectionStart' in element) {
+      // For textarea/input, create a hidden mirror div
+      const mirror = document.createElement('div');
+      const computed = getComputedStyle(element);
+      mirror.style.cssText = `
+        position: absolute;
+        visibility: hidden;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        font: ${computed.font};
+        padding: ${computed.padding};
+        border: ${computed.border};
+        width: ${element.offsetWidth}px;
+      `;
+      const text = element.value.substring(0, element.selectionStart);
+      mirror.textContent = text;
+      const span = document.createElement('span');
+      span.textContent = '|';
+      mirror.appendChild(span);
+      document.body.appendChild(mirror);
+      
+      const rect = element.getBoundingClientRect();
+      const spanRect = span.getBoundingClientRect();
+      const result = {
+        left: rect.left + spanRect.left - mirror.getBoundingClientRect().left,
+        top: rect.top + spanRect.top - mirror.getBoundingClientRect().top
+      };
+      mirror.remove();
+      return result;
+    }
+  } catch (e) {
+    console.debug('getCaretPosition failed', e);
+  }
+  return null;
+}
+
+function selectMentionOption(optionId) {
+  const inputElement = lastFocusedInput || findChatInput();
+  if (!inputElement) {
+    removeMentionPopover();
+    return;
+  }
+  
+  // Store the position info before removing popover
+  const savedStartPos = mentionStartPos;
+  const savedQuery = mentionQuery;
+  const savedInput = inputElement;
+  
+  // Remove the @query text first
+  removeAtQueryFromElement(inputElement, savedStartPos, savedQuery);
+  removeMentionPopover();
+  
+  // Show loading indicator
+  console.debug('Requesting context:', optionId);
+  
+  // Request the context from VS Code
+  chrome.runtime.sendMessage({ 
+    type: 'REQUEST_CONTEXT', 
+    contextType: optionId 
+  }, (response) => {
+    console.debug('Context response:', response);
+    
+    if (chrome.runtime.lastError) {
+      console.error('Chrome runtime error:', chrome.runtime.lastError);
+      return;
+    }
+    
+    if (response?.text) {
+      // Focus the input and insert the context text
+      savedInput.focus();
+      
+      // Small delay to ensure focus is established
+      setTimeout(() => {
+        const inserted = insertTextDirect(response.text);
+        if (!inserted) {
+          console.debug('Direct insert failed, trying fallback');
+          // Fallback: show in overlay
+          createOverlay(response.text, 'gpt-4');
+        }
+      }, 50);
+    } else if (response?.error) {
+      console.error('Context request failed:', response.error);
+    } else {
+      console.error('No response received from background');
+    }
+  });
+}
+
+function removeAtQueryFromElement(element, startPos, query) {
+  if (startPos === -1) return;
+  
+  try {
+    if ('value' in element && element.tagName !== 'DIV') {
+      const val = element.value;
+      const queryLen = query.length + 1; // +1 for the @
+      const before = val.slice(0, startPos);
+      const after = val.slice(startPos + queryLen);
+      element.value = before + after;
+      element.setSelectionRange(startPos, startPos);
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    } else if (element.isContentEditable) {
+      // For contenteditable, we need to find and remove the @query
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0);
+        const container = range.startContainer;
+        if (container.nodeType === Node.TEXT_NODE) {
+          const text = container.textContent;
+          const atIdx = text.lastIndexOf('@', range.startOffset);
+          if (atIdx >= 0) {
+            const newText = text.slice(0, atIdx) + text.slice(range.startOffset);
+            container.textContent = newText;
+            // Set cursor position
+            const newRange = document.createRange();
+            newRange.setStart(container, atIdx);
+            newRange.collapse(true);
+            sel.removeAllRanges();
+            sel.addRange(newRange);
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.debug('removeAtQueryFromElement failed', e);
+  }
+}
+
+function requestContextInfo() {
+  // Request token counts for each option from VS Code
+  chrome.runtime.sendMessage({ type: 'GET_CONTEXT_INFO' }, (response) => {
+    if (response?.contextInfo) {
+      // Update token counts in mentionOptions
+      for (const [id, info] of Object.entries(response.contextInfo)) {
+        const opt = mentionOptions.find(o => o.id === id);
+        if (opt && info.tokens !== undefined) {
+          opt.tokens = info.tokens;
+        }
+      }
+      updateMentionOptions();
+    }
+  });
+}
+
+function handleMentionKeydown(e) {
+  if (!mentionPopover) return false;
+  
+  const query = mentionQuery.toLowerCase();
+  const filtered = mentionOptions.filter(opt => 
+    opt.label.toLowerCase().includes(query) || 
+    opt.description.toLowerCase().includes(query)
+  );
+  
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    selectedMentionIndex = (selectedMentionIndex + 1) % filtered.length;
+    updateMentionSelection();
+    return true;
+  }
+  
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    selectedMentionIndex = (selectedMentionIndex - 1 + filtered.length) % filtered.length;
+    updateMentionSelection();
+    return true;
+  }
+  
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    if (filtered.length > 0) {
+      e.preventDefault();
+      selectMentionOption(filtered[selectedMentionIndex].id);
+      return true;
+    }
+  }
+  
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    removeMentionPopover();
+    return true;
+  }
+  
+  return false;
+}
+
+function handleInputForMention(e) {
+  const target = e.target;
+  if (!target || (!target.isContentEditable && target.tagName !== 'TEXTAREA' && target.tagName !== 'INPUT')) {
+    return;
+  }
+  
+  let text, cursorPos;
+  
+  if ('value' in target && target.tagName !== 'DIV') {
+    text = target.value;
+    cursorPos = target.selectionStart || 0;
+  } else if (target.isContentEditable) {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    if (range.startContainer.nodeType === Node.TEXT_NODE) {
+      text = range.startContainer.textContent;
+      cursorPos = range.startOffset;
+    } else {
+      return;
+    }
+  } else {
+    return;
+  }
+  
+  // Find @ or # symbol before cursor (# as fallback if @ is intercepted by site)
+  const textBeforeCursor = text.slice(0, cursorPos);
+  const atMatch = textBeforeCursor.match(/[@#](\w*)$/);
+  
+  if (atMatch) {
+    mentionQuery = atMatch[1];
+    mentionStartPos = cursorPos - atMatch[0].length;
+    
+    if (!mentionPopover) {
+      createMentionPopover(target);
+    } else {
+      selectedMentionIndex = 0;
+      updateMentionOptions();
+    }
+  } else {
+    removeMentionPopover();
+  }
+}
+
+// Listen for input events to detect @
+document.addEventListener('input', handleInputForMention, true);
+
+// Listen for keydown to handle navigation
+document.addEventListener('keydown', (e) => {
+  if (mentionPopover) {
+    if (handleMentionKeydown(e)) {
+      return;
+    }
+  }
+}, true);
+
+// Close popover when clicking outside
+document.addEventListener('click', (e) => {
+  if (mentionPopover && !mentionPopover.contains(e.target)) {
+    removeMentionPopover();
+  }
+}, true);
+
+// ==================== End @ Mention Popover ====================
 
 function insertTextDirect(text) {
   // Try last focused input, then find chat input, then active element

@@ -100,6 +100,16 @@ export function activate(context: vscode.ExtensionContext) {
             broadcastChips();
           }
           
+          // Handle @ mention context requests from web extension
+          if (data.type === "GET_CONTEXT") {
+            handleContextRequest(ws, data.contextType, data.requestId);
+          }
+          
+          // Handle @ mention context info requests (token counts)
+          if (data.type === "GET_CONTEXT_INFO") {
+            handleContextInfoRequest(ws, data.requestId);
+          }
+          
           // Handle AI response from web extension
           if (data.type === "AI_RESPONSE") {
             handleAIResponse(data);
@@ -182,6 +192,244 @@ export function activate(context: vscode.ExtensionContext) {
       await vscode.env.clipboard.writeText(text);
       vscode.window.showInformationMessage('Response copied to clipboard');
     }
+  }
+
+  // Handle @ mention context requests from web extension
+  async function handleContextRequest(ws: any, contextType: string, requestId: string) {
+    let text = '';
+    let tokens = 0;
+    
+    try {
+      switch (contextType) {
+        case 'focused-file': {
+          const editor = vscode.window.activeTextEditor;
+          if (editor) {
+            const doc = editor.document;
+            const filename = path.basename(doc.fileName);
+            text = `/* FILE: ${filename} (${doc.languageId}) */\n${doc.getText()}`;
+          } else {
+            text = '/* No file currently focused in VS Code */';
+          }
+          break;
+        }
+        
+        case 'selection': {
+          const editor = vscode.window.activeTextEditor;
+          if (editor && !editor.selection.isEmpty) {
+            const selectedText = editor.document.getText(editor.selection);
+            const filename = path.basename(editor.document.fileName);
+            text = `/* Selection from ${filename} */\n${selectedText}`;
+          } else {
+            text = '/* No text currently selected in VS Code */';
+          }
+          break;
+        }
+        
+        case 'visible-editors': {
+          const visibleEditors = vscode.window.visibleTextEditors;
+          if (visibleEditors.length > 0) {
+            const parts = visibleEditors.map(editor => {
+              const filename = path.basename(editor.document.fileName);
+              return `/* FILE: ${filename} (${editor.document.languageId}) */\n${editor.document.getText()}`;
+            });
+            text = parts.join('\n\n---\n\n');
+          } else {
+            text = '/* No visible editors in VS Code */';
+          }
+          break;
+        }
+        
+        case 'open-tabs': {
+          const allDocs = vscode.workspace.textDocuments.filter(doc => !doc.isUntitled && doc.uri.scheme === 'file');
+          if (allDocs.length > 0) {
+            const parts = allDocs.slice(0, 20).map(doc => { // Limit to 20 files
+              const filename = path.basename(doc.fileName);
+              return `/* FILE: ${filename} (${doc.languageId}) */\n${doc.getText()}`;
+            });
+            text = parts.join('\n\n---\n\n');
+            if (allDocs.length > 20) {
+              text += `\n\n/* ... and ${allDocs.length - 20} more files */`;
+            }
+          } else {
+            text = '/* No open files in VS Code */';
+          }
+          break;
+        }
+        
+        case 'problems': {
+          const diagnostics = vscode.languages.getDiagnostics();
+          const problems: string[] = [];
+          diagnostics.forEach(([uri, diags]) => {
+            const filename = path.basename(uri.fsPath);
+            diags.forEach(d => {
+              const severity = d.severity === vscode.DiagnosticSeverity.Error ? 'ERROR' :
+                              d.severity === vscode.DiagnosticSeverity.Warning ? 'WARNING' : 'INFO';
+              problems.push(`[${severity}] ${filename}:${d.range.start.line + 1}: ${d.message}`);
+            });
+          });
+          if (problems.length > 0) {
+            text = `/* VS Code Problems (${problems.length} total) */\n${problems.join('\n')}`;
+          } else {
+            text = '/* No problems detected in VS Code */';
+          }
+          break;
+        }
+        
+        case 'file-tree': {
+          const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+          if (workspaceRoot) {
+            const tree = await generateFileTree(workspaceRoot, 4);
+            const workspaceName = path.basename(workspaceRoot);
+            text = `/* File Tree: ${workspaceName} */\n${tree}`;
+          } else {
+            text = '/* No workspace folder open */';
+          }
+          break;
+        }
+        
+        case 'git-diff': {
+          try {
+            const gitExt = vscode.extensions.getExtension('vscode.git')?.exports;
+            const api = gitExt?.getAPI(1);
+            if (api && api.repositories.length > 0) {
+              const repo = api.repositories[0];
+              const changes = await repo.diffWithHEAD();
+              if (changes) {
+                text = `/* Git Changes (uncommitted) */\n${changes}`;
+              } else {
+                text = '/* No uncommitted changes */';
+              }
+            } else {
+              text = '/* No Git repository found */';
+            }
+          } catch (e) {
+            text = '/* Git extension not available */';
+          }
+          break;
+        }
+        
+        case 'terminal': {
+          // Get terminal output if available
+          const terminals = vscode.window.terminals;
+          if (terminals.length > 0) {
+            text = `/* Terminal: ${terminals.length} terminal(s) open */\n/* Note: Terminal content access is limited in VS Code API */`;
+          } else {
+            text = '/* No terminals open */';
+          }
+          break;
+        }
+        
+        default:
+          text = `/* Unknown context type: ${contextType} */`;
+      }
+      
+      tokens = Math.ceil(text.length / 4); // Simple token estimate
+      
+    } catch (e) {
+      console.error('Error getting context:', e);
+      text = `/* Error getting context: ${e} */`;
+    }
+    
+    ws.send(JSON.stringify({
+      type: 'CONTEXT_RESPONSE',
+      requestId,
+      text,
+      tokens
+    }));
+  }
+
+  // Handle @ mention context info requests (for showing token counts)
+  async function handleContextInfoRequest(ws: any, requestId: string) {
+    const contextInfo: { [key: string]: { tokens: number } } = {};
+    
+    try {
+      // Focused file
+      const editor = vscode.window.activeTextEditor;
+      if (editor) {
+        contextInfo['focused-file'] = { tokens: Math.ceil(editor.document.getText().length / 4) };
+      }
+      
+      // Selection
+      if (editor && !editor.selection.isEmpty) {
+        const selectedText = editor.document.getText(editor.selection);
+        contextInfo['selection'] = { tokens: Math.ceil(selectedText.length / 4) };
+      }
+      
+      // Visible editors
+      const visibleEditors = vscode.window.visibleTextEditors;
+      if (visibleEditors.length > 0) {
+        const totalChars = visibleEditors.reduce((sum, e) => sum + e.document.getText().length, 0);
+        contextInfo['visible-editors'] = { tokens: Math.ceil(totalChars / 4) };
+      }
+      
+      // Open tabs
+      const allDocs = vscode.workspace.textDocuments.filter(doc => !doc.isUntitled && doc.uri.scheme === 'file');
+      if (allDocs.length > 0) {
+        const totalChars = allDocs.slice(0, 20).reduce((sum, doc) => sum + doc.getText().length, 0);
+        contextInfo['open-tabs'] = { tokens: Math.ceil(totalChars / 4) };
+      }
+      
+      // Problems
+      const diagnostics = vscode.languages.getDiagnostics();
+      let problemCount = 0;
+      diagnostics.forEach(([_, diags]) => { problemCount += diags.length; });
+      if (problemCount > 0) {
+        contextInfo['problems'] = { tokens: Math.ceil(problemCount * 50 / 4) }; // Rough estimate
+      }
+      
+    } catch (e) {
+      console.error('Error getting context info:', e);
+    }
+    
+    ws.send(JSON.stringify({
+      type: 'CONTEXT_INFO_RESPONSE',
+      requestId,
+      contextInfo
+    }));
+  }
+
+  // Generate a file tree string
+  async function generateFileTree(dir: string, maxDepth: number, prefix: string = '', depth: number = 0): Promise<string> {
+    if (depth >= maxDepth) return prefix + '...\n';
+    
+    const config = vscode.workspace.getConfiguration('webaibridge');
+    const excludePatterns = config.get<string[]>('excludePatterns', []);
+    
+    let result = '';
+    try {
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      const filtered = entries.filter(entry => {
+        const fullPath = path.join(dir, entry.name);
+        return !shouldExclude(fullPath, excludePatterns, dir);
+      });
+      
+      filtered.sort((a, b) => {
+        if (a.isDirectory() && !b.isDirectory()) return -1;
+        if (!a.isDirectory() && b.isDirectory()) return 1;
+        return a.name.localeCompare(b.name);
+      });
+      
+      for (let i = 0; i < filtered.length && i < 50; i++) {
+        const entry = filtered[i];
+        const isLast = i === filtered.length - 1 || i === 49;
+        const connector = isLast ? '└── ' : '├── ';
+        const newPrefix = prefix + (isLast ? '    ' : '│   ');
+        
+        result += prefix + connector + entry.name + (entry.isDirectory() ? '/' : '') + '\n';
+        
+        if (entry.isDirectory()) {
+          result += await generateFileTree(path.join(dir, entry.name), maxDepth, newPrefix, depth + 1);
+        }
+      }
+      
+      if (filtered.length > 50) {
+        result += prefix + `... and ${filtered.length - 50} more\n`;
+      }
+    } catch (e) {
+      result += prefix + '(error reading directory)\n';
+    }
+    
+    return result;
   }
 
   function sendToClients(obj: any) {
