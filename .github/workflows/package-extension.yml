@@ -1,4 +1,4 @@
-name: Package VS Code Extension
+name: Package Extensions
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
       version:
-        description: 'Version number (e.g., 0.3.0) - only used if creating release'
+        description: 'Version number (e.g., 0.4.0) - only used if creating release'
         type: string
         required: false
 
@@ -24,10 +24,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: webaibridge-vscode/package-lock.json
 
-      - name: Install dependencies
+      # Build VS Code Extension
+      - name: Install VS Code extension dependencies
         working-directory: webaibridge-vscode
         run: npm ci
 
@@ -38,15 +37,29 @@ jobs:
       - name: Install vsce
         run: npm install -g @vscode/vsce
 
-      - name: Package extension
+      - name: Package VS Code extension
         working-directory: webaibridge-vscode
         run: vsce package
+
+      # Build Chrome Extension
+      - name: Create Chrome extension zip
+        run: |
+          cd web-extension
+          zip -r ../webaibridge-chrome-extension.zip . -x "*.git*" -x "node_modules/*" -x "*.map"
+          cd ..
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
         with:
           name: webaibridge-vsix
           path: webaibridge-vscode/*.vsix
+          retention-days: 30
+
+      - name: Upload Chrome extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webaibridge-chrome
+          path: webaibridge-chrome-extension.zip
           retention-days: 30
 
   release:
@@ -65,24 +78,32 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: webaibridge-vscode/package-lock.json
 
-      - name: Install dependencies
+      # Build VS Code Extension
+      - name: Install VS Code extension dependencies
         working-directory: webaibridge-vscode
         run: npm ci
 
       - name: Install vsce
         run: npm install -g @vscode/vsce
 
-      - name: Package extension
+      - name: Package VS Code extension
         working-directory: webaibridge-vscode
         run: vsce package
+
+      # Build Chrome Extension
+      - name: Create Chrome extension zip
+        run: |
+          cd web-extension
+          zip -r ../webaibridge-chrome-extension.zip . -x "*.git*" -x "node_modules/*" -x "*.map"
+          cd ..
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: webaibridge-vscode/*.vsix
+          files: |
+            webaibridge-vscode/*.vsix
+            webaibridge-chrome-extension.zip
           generate_release_notes: true
           tag_name: v${{ inputs.version }}
           name: WebAiBridge v${{ inputs.version }}
