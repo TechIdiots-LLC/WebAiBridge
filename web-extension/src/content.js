@@ -786,11 +786,12 @@ function insertInlineChip(optionId, label, tokens, inputElement, content, savedR
     // Build trigger pattern - the trigger followed by optional query
     const triggerWithQuery = savedQuery ? `${triggerSetting}${savedQuery}` : triggerSetting;
     
-    // For Copilot: use text replacement approach that doesn't rely on Range API
+    // For Copilot: use direct text manipulation since editor APIs are unreliable
     if (site === 'copilot') {
       try {
         // Find the trigger in the text
         const triggerIdx = currentText.lastIndexOf(triggerWithQuery);
+        console.debug('[WebAiBridge] Copilot insertion - triggerIdx:', triggerIdx, 'currentText:', currentText, 'triggerWithQuery:', triggerWithQuery);
         
         if (triggerIdx >= 0) {
           const triggerLen = triggerSetting.length + (savedQuery ? savedQuery.length : 0);
@@ -798,46 +799,51 @@ function insertInlineChip(optionId, label, tokens, inputElement, content, savedR
           const after = currentText.slice(triggerIdx + triggerLen);
           const newText = before + wrappedPlaceholder + ' ' + after;
           
-          // Use Range to select all and replace with modern API
-          const range = document.createRange();
-          range.selectNodeContents(inputElement);
-          const sel = window.getSelection();
-          sel.removeAllRanges();
-          sel.addRange(range);
+          console.debug('[WebAiBridge] Copilot - newText to insert:', newText);
           
-          // Use insertTextIntoCE for proper editor integration
-          insertTextIntoCE(inputElement, newText);
+          // Method 1: Try setting innerText directly (works for some React editors)
+          inputElement.innerText = newText;
           
-          // Try to position cursor at the right place
+          // Dispatch multiple events to trigger React's handlers
+          inputElement.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+          inputElement.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          
+          // Also dispatch a custom input event that React might listen to
+          const inputEvent = new InputEvent('input', {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            data: newText,
+            inputType: 'insertText'
+          });
+          inputElement.dispatchEvent(inputEvent);
+          
+          // Position cursor at end
           setTimeout(() => {
             try {
-              const newSel = window.getSelection();
-              if (newSel.rangeCount > 0) {
-                const newRange = newSel.getRangeAt(0);
-                const targetPos = triggerIdx + wrappedPlaceholder.length + 1;
-                // Walk to find position
-                const walker = document.createTreeWalker(inputElement, NodeFilter.SHOW_TEXT, null, false);
-                let charCount = 0;
-                while (walker.nextNode()) {
-                  const node = walker.currentNode;
-                  const nodeLen = (node.textContent || '').length;
-                  if (charCount + nodeLen >= targetPos) {
-                    newRange.setStart(node, Math.min(targetPos - charCount, nodeLen));
-                    newRange.collapse(true);
-                    newSel.removeAllRanges();
-                    newSel.addRange(newRange);
-                    break;
-                  }
-                  charCount += nodeLen;
-                }
+              const range = document.createRange();
+              const sel = window.getSelection();
+              if (inputElement.childNodes.length > 0) {
+                const lastNode = inputElement.childNodes[inputElement.childNodes.length - 1];
+                const nodeLen = lastNode.textContent?.length || 0;
+                range.setStart(lastNode, nodeLen);
+                range.collapse(true);
+              } else {
+                range.selectNodeContents(inputElement);
+                range.collapse(false);
               }
+              sel.removeAllRanges();
+              sel.addRange(range);
+              inputElement.focus();
             } catch (e) {
               console.debug('[WebAiBridge] Cursor positioning failed', e);
             }
           }, 10);
           
           inserted = true;
-          console.debug('[WebAiBridge] Inserted placeholder via Copilot text replacement');
+          console.debug('[WebAiBridge] Inserted placeholder via Copilot innerText');
+        } else {
+          console.debug('[WebAiBridge] Copilot - trigger not found in text');
         }
       } catch (e) {
         console.debug('[WebAiBridge] Copilot text replacement failed', e);
