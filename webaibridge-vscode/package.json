@@ -187,14 +187,20 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -w -p ./"
+    "watch": "tsc -w -p ./",
+    "format:webext": "npx prettier --write ../web-extension/src/**/*.js",
+    "format": "npx prettier --write \"src/**/*.ts\" ../web-extension/src/**/*.js",
+    "lint:webext": "npx eslint ../web-extension/src/**/*.js --ext .js",
+    "lint:webext:fix": "npx eslint ../web-extension/src/**/*.js --ext .js --fix"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.70.0",
     "@types/ws": "^8.5.10",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "prettier": "^3.8.0",
+    "eslint": "^9.39.2"
   },
   "dependencies": {
     "ws": "^8.13.0"

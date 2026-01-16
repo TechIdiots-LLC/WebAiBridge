@@ -4,9 +4,17 @@
   "license": "BSD-2-Clause",
   "description": "Chrome extension for WebAiBridge",
   "scripts": {
-    "build": "echo 'No build step for prototype'"
+    "build": "echo 'No build step for prototype'",
+    "format": "npx prettier --write \"src/**/*.js\"",
+    "lint": "npx eslint \"src/**/*.js\" --ext .js",
+    "lint:fix": "npx eslint \"src/**/*.js\" --ext .js --fix"
   },
   "dependencies": {
     "tiktoken": "^1.0.10"
+  }
+  ,
+  "devDependencies": {
+    "prettier": "^3.8.0",
+    "eslint": "^9.39.2"
   }
 }
