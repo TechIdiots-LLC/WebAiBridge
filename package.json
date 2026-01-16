@@ -1,0 +1,22 @@
+{
+  "name": "webaibridge-monorepo",
+  "private": true,
+  "workspaces": [
+    "web-extension",
+    "webaibridge-vscode"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "install:all": "npm install --workspaces",
+    "bootstrap": "npm install --workspaces",
+    "format": "npm run format --workspaces",
+    "lint": "npm run lint --workspaces",
+    "lint:fix": "npm run lint:fix --workspaces"
+  },
+  "devDependencies": {
+    "prettier": "^3.8.0",
+    "eslint": "^9.39.2"
+  }
+}
