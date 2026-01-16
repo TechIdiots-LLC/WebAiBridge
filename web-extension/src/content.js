@@ -127,31 +127,26 @@ const SITE_CONFIG = {
   chatgpt: {
     hostPatterns: ['chat.openai.com', 'chatgpt.com'],
     inputSelectors: ['#prompt-textarea', 'textarea[data-id="root"]', 'div[contenteditable="true"][id*="prompt"]', 'textarea'],
-    triggers: ['@', '#'],
     sendButtonSelectors: ['button[data-testid="send-button"]', 'button[data-testid*="send"]']
   },
   gemini: {
     hostPatterns: ['gemini.google.com'],
     inputSelectors: ['.ql-editor[contenteditable="true"]', 'rich-textarea .ql-editor', 'div[contenteditable="true"][aria-label*="Enter"]', 'div[contenteditable="true"]'],
-    triggers: ['@', '#'],
     sendButtonSelectors: ['button[aria-label*="Send"]']
   },
   claude: {
     hostPatterns: ['claude.ai'],
     inputSelectors: ['div[contenteditable="true"].ProseMirror', 'div[contenteditable="true"]'],
-    triggers: ['@', '#'],
     sendButtonSelectors: ['button[aria-label*="Send"]']
   },
   aistudio: {
     hostPatterns: ['aistudio.google.com'],
     inputSelectors: ['textarea[aria-label*="prompt"]', 'textarea'],
-    triggers: ['@', '#'],
     sendButtonSelectors: ['button[aria-label*="Send"]']
   },
   copilot: {
     hostPatterns: ['m365.cloud.microsoft.com', 'copilot.microsoft.com'],
     inputSelectors: ['textarea[placeholder*="Message"]', 'div[contenteditable="true"][data-placeholder]', 'textarea', 'div[contenteditable="true"]'],
-    triggers: ['@', '#'],
     sendButtonSelectors: ['button[aria-label*="Send"]', 'button[data-testid*="send"]']
   }
 };
