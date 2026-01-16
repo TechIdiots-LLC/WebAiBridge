@@ -57,8 +57,15 @@ code --install-extension webaibridge-*.vsix
 ## Usage
 
 ### @ Mentions (in AI Chat)
-Type `@` in any supported AI chat input:
+Type a trigger in any supported AI chat input:
 
+**Triggers by site:**
+| Site | Trigger | Notes |
+|------|---------|-------|
+| ChatGPT, Claude, Gemini, AI Studio | `@` or `#` | Standard |
+| Microsoft Copilot | `//` or `/wab` | Copilot reserves `@` for its own menu |
+
+**Available context:**
 | Trigger | Description |
 |---------|-------------|
 | `@focused-file` | Currently open file in VS Code |

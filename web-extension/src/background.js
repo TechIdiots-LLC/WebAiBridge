@@ -19,6 +19,8 @@ let discoveredInstances = []; // Array of { port, workspaceName, workspacePath }
 let selectedPort = PORT_START; // Currently selected instance port
 let ws = null;
 let reconnectTimer = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 6;
 
 // Load saved settings on startup
 chrome.storage.local.get(['currentModel', 'contextChips', 'selectedPort'], (res) => {
@@ -126,6 +128,8 @@ function connectBridge(port = selectedPort) {
     console.debug('Connected to VSCode bridge on port', port);
     selectedPort = port;
     chrome.storage.local.set({ selectedPort });
+    // Reset reconnect attempts on successful connection
+    reconnectAttempts = 0;
     // Request current chips from VS Code
     ws.send(JSON.stringify({ type: "GET_CHIPS" }));
   };
@@ -174,12 +178,32 @@ function connectBridge(port = selectedPort) {
         return;
       }
       
+      // Handle streamed context responses for large files
+      if (data.type === "CONTEXT_RESPONSE_STREAM") {
+        const callback = pendingContextRequests.get(data.requestId);
+        if (callback) {
+          pendingContextRequests.delete(data.requestId);
+          callback({ stream: true, chunks: data.chunks, totalSize: data.totalSize });
+        }
+        return;
+      }
+      
       // Handle @ mention context info response from VS Code
       if (data.type === "CONTEXT_INFO_RESPONSE") {
         const callback = pendingContextRequests.get(data.requestId);
         if (callback) {
           pendingContextRequests.delete(data.requestId);
           callback({ contextInfo: data.contextInfo });
+        }
+        return;
+      }
+
+      // Handle file list response for file-picker
+      if (data.type === "FILE_LIST_RESPONSE") {
+        const callback = pendingContextRequests.get(data.requestId);
+        if (callback) {
+          pendingContextRequests.delete(data.requestId);
+          callback({ files: data.files });
         }
         return;
       }
@@ -310,7 +334,17 @@ function formatChipsForInsert(chips, model = 'default', shouldTruncate = false) 
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; connectBridge(selectedPort); }, 3000);
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    console.error('Max reconnect attempts reached, will not retry automatically');
+    return;
+  }
+  reconnectAttempts++;
+  const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts - 1));
+  console.debug(`Scheduling reconnect attempt ${reconnectAttempts} in ${delay}ms`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectBridge(selectedPort);
+  }, delay);
 }
 
 // Keep service worker alive by pinging periodically
@@ -515,7 +549,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     ws.send(JSON.stringify({
       type: "GET_CONTEXT",
       contextType: msg.contextType,
-      requestId: requestId
+      requestId: requestId,
+      filePath: msg.filePath || null
     }));
     
     // Timeout after 10 seconds
@@ -529,6 +564,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }, 10000);
     
     return true; // Will respond asynchronously
+  }
+
+  // Request a file list from VS Code (for file-picker) - async response
+  if (msg?.type === "REQUEST_FILE_LIST") {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      sendResponse({ error: "Not connected to VS Code" });
+      return true;
+    }
+
+    const requestId = `files_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    pendingContextRequests.set(requestId, (response) => {
+      sendResponse(response);
+    });
+
+    ws.send(JSON.stringify({ type: "GET_FILE_LIST", requestId }));
+
+    // Timeout
+    setTimeout(() => {
+      if (pendingContextRequests.has(requestId)) {
+        const cb = pendingContextRequests.get(requestId);
+        pendingContextRequests.delete(requestId);
+        cb({ files: [] });
+      }
+    }, 10000);
+
+    return true;
   }
 
   // @ Mention: Get context info (token counts) from VS Code

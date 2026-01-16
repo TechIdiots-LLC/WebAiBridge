@@ -3,6 +3,43 @@ import * as path from "path";
 import * as fs from "fs";
 const { WebSocketServer } = require("ws");
 
+// Simple in-memory context cache to avoid repeated file reads
+class ContextCache {
+  private cache = new Map<string, { content: string; timestamp: number }>();
+  private readonly TTL = 5000; // 5 seconds
+
+  get(filePath: string): string | null {
+    const entry = this.cache.get(filePath);
+    if (!entry) return null;
+    if (Date.now() - entry.timestamp > this.TTL) {
+      this.cache.delete(filePath);
+      return null;
+    }
+    return entry.content;
+  }
+
+  set(filePath: string, content: string) {
+    this.cache.set(filePath, { content, timestamp: Date.now() });
+  }
+
+  invalidate(filePath: string) {
+    this.cache.delete(filePath);
+  }
+}
+
+const contextCache = new ContextCache();
+
+// Stream large files into chunks
+async function streamLargeFile(filePath: string, chunkSize: number = 50000) {
+  const content = await fs.promises.readFile(filePath, 'utf8');
+  const chunks: Array<{ text: string; part: number; total: number }> = [];
+  const total = Math.ceil(content.length / chunkSize);
+  for (let i = 0; i < content.length; i += chunkSize) {
+    chunks.push({ text: content.slice(i, i + chunkSize), part: Math.floor(i / chunkSize) + 1, total });
+  }
+  return { chunks, totalSize: content.length, content };
+}
+
 // Context chip structure
 interface ContextChip {
   id: string;
@@ -159,8 +196,46 @@ export function activate(context: vscode.ExtensionContext) {
           
           // Handle @ mention context requests from web extension
           if (data.type === "GET_CONTEXT") {
-            handleContextRequest(ws, data.contextType, data.requestId);
+            handleContextRequest(ws, data.contextType, data.requestId, data.filePath);
           }
+
+            // Handle file list requests for file-picker (@ mention) UI
+            if (data.type === "GET_FILE_LIST") {
+              (async () => {
+                try {
+                  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+                  // Use findFiles to enumerate files, avoid node_modules and .git by default
+                  const uris = await vscode.workspace.findFiles('**/*', '{**/node_modules/**,**/.git/**}', 500);
+                  // Map to a lightweight list (relative path, language guess)
+                  const langMap: Record<string, string> = {
+                    'ts': 'typescript', 'tsx': 'typescriptreact',
+                    'js': 'javascript', 'jsx': 'javascriptreact',
+                    'py': 'python', 'rb': 'ruby', 'rs': 'rust',
+                    'go': 'go', 'java': 'java', 'cs': 'csharp',
+                    'cpp': 'cpp', 'c': 'c', 'h': 'c',
+                    'html': 'html', 'css': 'css', 'scss': 'scss',
+                    'json': 'json', 'yaml': 'yaml', 'yml': 'yaml',
+                    'md': 'markdown', 'sql': 'sql', 'sh': 'shellscript'
+                  };
+
+                  const files = uris.map(u => {
+                    const full = u.fsPath;
+                    const rel = workspaceRoot ? path.relative(workspaceRoot, full) : full;
+                    const ext = path.extname(full).slice(1).toLowerCase();
+                    return {
+                      path: full,
+                      label: rel,
+                      languageId: langMap[ext] || 'plaintext'
+                    };
+                  }).slice(0, 500);
+
+                  ws.send(JSON.stringify({ type: 'FILE_LIST_RESPONSE', requestId: data.requestId, files }));
+                } catch (e) {
+                  console.error('Error building file list', e);
+                  ws.send(JSON.stringify({ type: 'FILE_LIST_RESPONSE', requestId: data.requestId, files: [] }));
+                }
+              })();
+            }
           
           // Handle @ mention context info requests (token counts)
           if (data.type === "GET_CONTEXT_INFO") {
@@ -201,13 +276,14 @@ export function activate(context: vscode.ExtensionContext) {
     // Store the last response
     context.workspaceState.update('lastAIResponse', { text, site, isCode, timestamp: Date.now() });
     
-    // Show notification with options
+    // Show notification with options (added Propose Diff for sync-back)
     const action = await vscode.window.showInformationMessage(
       `Received ${isCode ? 'code' : 'response'} from ${site}`,
       'Insert at Cursor',
       'New File',
       'Show Preview',
-      'Copy to Clipboard'
+      'Copy to Clipboard',
+      'Propose Diff'
     );
     
     if (action === 'Insert at Cursor') {
@@ -226,23 +302,25 @@ export function activate(context: vscode.ExtensionContext) {
         await vscode.window.showTextDocument(doc);
       }
     } else if (action === 'New File') {
-      // Detect language from content
+      // Try to extract code block if present
+      const codeBlockRegex = /```(?:([\w-+.]+))?\s*([\s\S]*?)```/g;
+      const matches = [...text.matchAll(codeBlockRegex)];
+      let contentToOpen = text;
       let language = 'plaintext';
-      if (text.includes('```typescript') || text.includes('```ts')) {
-        language = 'typescript';
-      } else if (text.includes('```javascript') || text.includes('```js')) {
-        language = 'javascript';
-      } else if (text.includes('```python') || text.includes('```py')) {
-        language = 'python';
-      } else if (text.includes('```html')) {
-        language = 'html';
-      } else if (text.includes('```css')) {
-        language = 'css';
-      } else if (text.includes('```json')) {
-        language = 'json';
+
+      if (matches.length > 0) {
+        // Use the first code block
+        language = matches[0][1] || '';
+        contentToOpen = matches[0][2].trim();
       }
-      
-      const doc = await vscode.workspace.openTextDocument({ content: text, language });
+
+      // If still no language and we have an active editor, use its language
+      const editor = vscode.window.activeTextEditor;
+      if ((!language || language === '') && editor) {
+        language = editor.document.languageId;
+      }
+
+      const doc = await vscode.workspace.openTextDocument({ content: contentToOpen, language: (language || undefined) });
       await vscode.window.showTextDocument(doc);
     } else if (action === 'Show Preview') {
       // Show in output channel
@@ -255,22 +333,99 @@ export function activate(context: vscode.ExtensionContext) {
     } else if (action === 'Copy to Clipboard') {
       await vscode.env.clipboard.writeText(text);
       vscode.window.showInformationMessage('Response copied to clipboard');
+    } else if (action === 'Propose Diff') {
+      const editor = vscode.window.activeTextEditor;
+      // If there is an active editor with a file, open a diff view between AI response and current file
+      if (editor && !editor.document.isUntitled && editor.document.uri.scheme === 'file') {
+        // Extract code block if present; prefer first fenced block
+        const codeBlockRegex = /```(?:([\w-+.]+))?\s*([\s\S]*?)```/g;
+        const matches = [...text.matchAll(codeBlockRegex)];
+        const cleanCode = matches.length > 0 ? matches[0][2].trim() : text;
+
+        // Use active editor language as hint
+        const lang = editor.document.languageId || undefined;
+        const tempDoc = await vscode.workspace.openTextDocument({ content: cleanCode, language: lang });
+        const title = `AI Proposal ↔ ${path.basename(editor.document.fileName)}`;
+        await vscode.commands.executeCommand('vscode.diff', tempDoc.uri, editor.document.uri, title);
+
+        const apply = await vscode.window.showInformationMessage('Overwrite file with AI changes?', 'Apply Changes', 'Cancel');
+        if (apply === 'Apply Changes') {
+          try {
+            const edit = new vscode.WorkspaceEdit();
+            const lastLine = editor.document.lineCount - 1;
+            const fullRange = new vscode.Range(new vscode.Position(0, 0), editor.document.lineAt(lastLine).range.end);
+            edit.replace(editor.document.uri, fullRange, cleanCode);
+            const applied = await vscode.workspace.applyEdit(edit);
+            if (applied) {
+              vscode.window.showInformationMessage('Applied AI-proposed changes to current file');
+            } else {
+              vscode.window.showErrorMessage('Failed to apply proposed changes');
+            }
+          } catch (e) {
+            console.error('Error applying proposed changes', e);
+            vscode.window.showErrorMessage('Error applying proposed changes');
+          }
+        }
+      } else {
+        // No active file - open as a new document to let user review
+        const doc = await vscode.workspace.openTextDocument({ content: text });
+        await vscode.window.showTextDocument(doc);
+      }
     }
   }
 
   // Handle @ mention context requests from web extension
-  async function handleContextRequest(ws: any, contextType: string, requestId: string) {
+  async function handleContextRequest(ws: any, contextType: string, requestId: string, filePath?: string) {
     let text = '';
     let tokens = 0;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    let responseLabel: string | undefined = undefined;
     
     try {
       switch (contextType) {
+        case 'file': {
+          // Specific file requested by path - use cache & streaming for large files
+          if (filePath) {
+            try {
+              const cached = contextCache.get(filePath);
+              if (cached) {
+                const label = workspaceRoot ? path.relative(workspaceRoot, filePath) : path.basename(filePath);
+                ws.send(JSON.stringify({ type: 'CONTEXT_RESPONSE', requestId, text: cached, tokens: Math.ceil(cached.length / 4), label }));
+                break;
+              }
+
+              const stat = await fs.promises.stat(filePath).catch(() => null);
+              if (stat && stat.size > 50000) {
+                // Stream large file in chunks
+                const { chunks, totalSize, content } = await streamLargeFile(filePath);
+                const label = workspaceRoot ? path.relative(workspaceRoot, filePath) : path.basename(filePath);
+                ws.send(JSON.stringify({ type: 'CONTEXT_RESPONSE_STREAM', requestId, chunks, totalSize, label }));
+                // Cache combined content for a short TTL
+                contextCache.set(filePath, content);
+                break;
+              }
+
+              const doc = await fs.promises.readFile(filePath, 'utf8');
+              const filename = path.basename(filePath);
+              text = `/* FILE: ${filename} (file) */\n${doc}`;
+              contextCache.set(filePath, text);
+              // Attach label for the response below (workspace-relative when possible)
+              responseLabel = workspaceRoot ? path.relative(workspaceRoot, filePath) : path.basename(filePath);
+            } catch (e) {
+              text = `/* Failed to open file: ${filePath} */`;
+            }
+          } else {
+            text = '/* No filePath provided */';
+          }
+          break;
+        }
         case 'focused-file': {
           const editor = vscode.window.activeTextEditor;
           if (editor) {
             const doc = editor.document;
             const filename = path.basename(doc.fileName);
             text = `/* FILE: ${filename} (${doc.languageId}) */\n${doc.getText()}`;
+            responseLabel = workspaceRoot ? path.relative(workspaceRoot, doc.fileName) : path.basename(doc.fileName);
           } else {
             text = '/* No file currently focused in VS Code */';
           }
@@ -283,6 +438,7 @@ export function activate(context: vscode.ExtensionContext) {
             const selectedText = editor.document.getText(editor.selection);
             const filename = path.basename(editor.document.fileName);
             text = `/* Selection from ${filename} */\n${selectedText}`;
+            responseLabel = workspaceRoot ? path.relative(workspaceRoot, editor.document.fileName) : path.basename(editor.document.fileName);
           } else {
             text = '/* No text currently selected in VS Code */';
           }
@@ -398,7 +554,8 @@ export function activate(context: vscode.ExtensionContext) {
       type: 'CONTEXT_RESPONSE',
       requestId,
       text,
-      tokens
+      tokens,
+      label: responseLabel
     }));
   }
 
