@@ -167,11 +167,11 @@ function connectBridge(port = selectedPort) {
       
       // Handle @ mention context response from VS Code
       if (data.type === "CONTEXT_RESPONSE") {
-        console.debug('CONTEXT_RESPONSE received:', data.requestId, data.text?.length, 'chars');
+        console.debug('CONTEXT_RESPONSE received:', data.requestId, data.text?.length, 'chars', 'label:', data.label);
         const callback = pendingContextRequests.get(data.requestId);
         if (callback) {
           pendingContextRequests.delete(data.requestId);
-          callback({ text: data.text, tokens: data.tokens });
+          callback({ text: data.text, tokens: data.tokens, label: data.label });
         } else {
           console.debug('No pending callback for requestId:', data.requestId);
         }

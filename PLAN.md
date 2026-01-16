@@ -2,7 +2,7 @@
 
 This document lists the goals, planned steps, feature list, and current status for the two-part WebAiBridge prototype (VSCode extension + Chrome extension bridge).
 
-**Current Version: 0.5.0**
+**Current Version: 0.6.0**
 
 ## Project Goals
 - Build a VSCode extension that can extract code/context and send it to a browser-based AI chat site.
@@ -20,7 +20,7 @@ This document lists the goals, planned steps, feature list, and current status f
 - Browser tab screenshots and attachments.
 - Context chips UI with token chips, previews, and history.
 
-## What we have implemented so far (v0.5.0)
+## What we have implemented so far (v0.6.0)
 
 ### Core Bridge
 - **Local WebSocket Bridge**: VS Code runs WebSocket server on ports 64923-64932 with auto-discovery
@@ -33,11 +33,11 @@ This document lists the goals, planned steps, feature list, and current status f
 - **Ignore Patterns**: Configurable exclude patterns, .gitignore parsing, file size limits
 
 ### Chrome Extension
-- **@ Mention System**: Type `@` in AI chat to pull context from VS Code
-  - `@focused-file` → inserts as `@filename.ext`
+- **@ Mention System**: Type trigger (default `@`, customizable) in AI chat to pull context from VS Code
+  - `@focused-file` → inserts as `@filename.ext` (uses actual filename from VS Code)
   - `@selection` → inserts as `@selection-1`, `@selection-2`, etc.
   - `@visible-editors`, `@open-tabs`, `@problems`, `@file-tree`, `@git-diff`, `@terminal`
-  - Site-specific triggers: `//` or `/wab` for Microsoft Copilot
+  - **Customizable Trigger**: Set your preferred trigger character in popup settings
 - **Context Chip Bar**: Floating bar above input showing all added contexts
   - Total token count display
   - Hide/show toggle
@@ -61,12 +61,23 @@ This document lists the goals, planned steps, feature list, and current status f
 - Gemini / Google AI Studio
 - Microsoft Copilot (M365)
 
-### Performance Optimizations (v0.5.0)
+### Performance Optimizations (v0.6.0)
 - **MutationObserver**: Replaced setInterval with MutationObserver for input clear detection
-- **ResizeObserver**: Dynamic chip bar repositioning on window/sidebar resize
+- **ResizeObserver**: Dynamic chip bar repositioning on input element resize
 - **textInput Events**: Proper event dispatch for ProseMirror/Quill editors
-- **Improved Range API**: Better insertIntoContentEditable fallback preserving formatting
+- **Modern Input APIs**: Replaced execCommand with beforeinput events and Range API
 - **Generation Complete Detection**: Watch for "Stop generating" button removal
+
+### Microsoft Copilot Support (v0.6.0)
+- **Shadow DOM Traversal**: Deep queries through Fluent UI shadow roots
+- **Sanitizer-Proof Placeholders**: `[[WAB::id::label]]` format survives React sanitization
+- **Modern Text Insertion**: Uses beforeinput events with text replacement fallback
+- **ARIA-based Button Detection**: Finds send button via role attributes in shadow DOM
+
+### Chip Bar Improvements (v0.6.0)
+- **Text Sync**: Chips auto-removed when placeholders deleted from input
+- **ID Display**: Shows placeholder ID in chip bar for reference
+- **Dynamic Repositioning**: ResizeObserver + MutationObserver + polling fallback
 
 ### Packaging & Distribution
 - GitHub Actions workflow builds both VS Code (.vsix) and Chrome (.zip) extensions
@@ -78,10 +89,11 @@ This document lists the goals, planned steps, feature list, and current status f
 3. ✅ ~~Implement ignore patterns~~ — Implemented with .gitignore support
 4. ✅ ~~Context chips UI~~ — Implemented with chip bar, preview, remove
 5. ✅ ~~Per-message limits and chunking~~ — Implemented with three modes
-6. ✅ ~~@ mention system~~ — Implemented with site-specific triggers
+6. ✅ ~~@ mention system~~ — Implemented with customizable trigger
 7. ✅ ~~Multi-instance support~~ — Implemented with port scanning and instance picker
-8. Add authentication flow and settings sync
-9. Expand file extraction: PDFs, DOCX, images (OCR)
+8. ✅ ~~Microsoft Copilot support~~ — Implemented with Shadow DOM and sanitizer-proof placeholders
+9. Add authentication flow and settings sync
+10. Expand file extraction: PDFs, DOCX, images (OCR)
 
 ## Medium-term roadmap
 - **File Picker @ Mentions**: `@package.json`, `@src/utils.ts` to reference specific files
@@ -125,7 +137,7 @@ code "C:\Users\Andrew\Documents\GitHub\WebAiBridge"
 
 3. **Option A: Install packaged extension (recommended)**
    - Download the latest `.vsix` from GitHub Releases or run the packaging workflow
-   - Install: `code --install-extension webaibridge-vscode-0.5.0.vsix`
+   - Install: `code --install-extension webaibridge-0.6.0.vsix`
    - Reload VS Code
 
 4. **Option B: Development mode**
@@ -154,8 +166,8 @@ Then press F5 in VSCode to launch the Extension Development Host.
 - In the file explorer: Right-click files/folders for quick add
 
 7. Or use @ mentions in AI chat:
-- Type `@` in ChatGPT, Claude, Gemini, or AI Studio
-- Type `//` or `/wab` in Microsoft Copilot
+- Type your trigger (default `@`) in any supported AI site
+- Customize the trigger character in the popup settings
 - Select context type from the popover
 - Placeholder like `@content.js` appears in your message
 - On submit, placeholder expands to full content
@@ -169,8 +181,8 @@ Then press F5 in VSCode to launch the Extension Development Host.
 - Gemini token estimates are reduced by 15% to account for SentencePiece efficiency.
 
 ## Where things live (quick links)
-- VSCode extension source: `vscode-extension/src/extension.ts`
-- VSCode extension config: `vscode-extension/package.json`
+- VSCode extension source: `webaibridge-vscode/src/extension.ts`
+- VSCode extension config: `webaibridge-vscode/package.json`
 - Web extension popup: `web-extension/src/popup.html`, `web-extension/src/popup.js`
 - Web extension background: `web-extension/src/background.js`
 - Content script: `web-extension/src/content.js`
@@ -179,4 +191,4 @@ Then press F5 in VSCode to launch the Extension Development Host.
 - Landing page: `landing-page.md`
 
 ---
-Last updated: 2026-01-15
+Last updated: 2026-01-16

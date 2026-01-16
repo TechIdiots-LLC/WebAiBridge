@@ -694,67 +694,75 @@ function isValidPlaceholder(text) {
 function insertInlineChip(optionId, label, tokens, inputElement, content, savedRange = null, savedQuery = '') {
   const uniqueId = `wab-${optionId}-${Date.now()}`;
   
-  // Generate an appropriate placeholder based on context type
-  let placeholder;
+  // Generate an appropriate placeholder label based on context type (without @ prefix)
+  let placeholderLabel;
   
-  if (optionId === 'focused-file' && label && label !== 'Focused File') {
+  // Check if label looks like a filename (has extension) rather than a generic label
+  const looksLikeFilename = label && /\.[a-zA-Z0-9]+$/.test(label) && !label.startsWith('Focused');
+  
+  if (optionId === 'focused-file' && looksLikeFilename) {
     // Use the actual filename for focused files
     // Extract just the filename from path if needed
     const filename = label.includes('/') ? label.split('/').pop() : 
                      label.includes('\\') ? label.split('\\').pop() : label;
-    placeholder = `@${filename}`;
+    placeholderLabel = filename;
   } else if (optionId === 'selection') {
     // Selections get incrementing IDs
     selectionCounter++;
-    placeholder = `@selection-${selectionCounter}`;
+    placeholderLabel = `selection-${selectionCounter}`;
   } else {
     // For other types, use the option ID
     // If we already have one with this ID, add a number
-    const baseId = `@${optionId}`;
+    const baseId = optionId;
     if (usedPlaceholders[baseId]) {
       usedPlaceholders[baseId]++;
-      placeholder = `${baseId}-${usedPlaceholders[baseId]}`;
+      placeholderLabel = `${baseId}-${usedPlaceholders[baseId]}`;
     } else {
       usedPlaceholders[baseId] = 1;
-      placeholder = baseId;
+      placeholderLabel = baseId;
     }
   }
   
   // Handle duplicate placeholders (e.g., same file added twice)
-  let finalPlaceholder = placeholder;
+  let finalLabel = placeholderLabel;
   let dupCounter = 1;
-  while (contextContents[finalPlaceholder]) {
+  let testPlaceholder = createSecurePlaceholder(finalLabel);
+  while (contextContents[testPlaceholder]) {
     dupCounter++;
-    finalPlaceholder = `${placeholder}-${dupCounter}`;
+    finalLabel = `${placeholderLabel}-${dupCounter}`;
+    testPlaceholder = createSecurePlaceholder(finalLabel);
   }
-  placeholder = finalPlaceholder;
+  placeholderLabel = finalLabel;
   
   console.debug('[WebAiBridge] insertInlineChip called:', {
     optionId,
     label,
     tokens,
     contentLength: content?.length,
-    placeholder,
+    placeholderLabel,
     uniqueId,
     hasSavedRange: !!savedRange,
     savedQuery
   });
   
   // Create a secure, hard-to-accidentally-type placeholder token
-  const wrappedPlaceholder = createSecurePlaceholder(placeholder);
+  const wrappedPlaceholder = createSecurePlaceholder(placeholderLabel);
 
   // Store content for later expansion (keyed by wrapped placeholder for easy lookup)
   contextContents[wrappedPlaceholder] = content;
-  console.debug('[WebAiBridge] Stored content for placeholder:', placeholder, 'contextContents now has', Object.keys(contextContents).length, 'entries');
+  console.debug('[WebAiBridge] Stored content for placeholder:', placeholderLabel, 'contextContents now has', Object.keys(contextContents).length, 'entries');
   
-  // Track the chip
+  // Track the chip - use placeholderLabel (the actual filename) for display when available
   const option = mentionOptions.find(o => o.id === optionId);
+  const displayLabel = (optionId === 'focused-file' && placeholderLabel && placeholderLabel !== 'focused-file') 
+    ? placeholderLabel 
+    : (label || option?.label || optionId);
   insertedContexts.push({
     id: uniqueId,
     // store the wrapped placeholder as the token actually present in the input
     placeholder: wrappedPlaceholder,
     typeId: optionId,
-    label: label || option?.label || optionId,
+    label: displayLabel,
     icon: option?.icon || '📎',
     tokens,
     timestamp: Date.now(),
@@ -2030,7 +2038,12 @@ function selectMentionOption(optionId) {
     type: 'REQUEST_CONTEXT', 
     contextType: optionId 
   }, async (response) => {
-    console.debug('Context response:', response);
+    console.debug('[WebAiBridge] Context response received:', { 
+      hasText: !!response?.text, 
+      textLen: response?.text?.length,
+      label: response?.label,
+      tokens: response?.tokens 
+    });
     hideLoadingIndicator();
     
     if (chrome.runtime.lastError) {
@@ -2047,6 +2060,7 @@ function selectMentionOption(optionId) {
       // Get label for chip (use filename if available, else option label)
       const option = mentionOptions.find(o => o.id === optionId);
       const chipLabel = response.label || option?.label || optionId;
+      console.debug('[WebAiBridge] Using chipLabel:', chipLabel, 'response.label was:', response.label);
       const contentToInsert = limitResult.text;
       
       switch (limitResult.action) {
@@ -2216,11 +2230,18 @@ function requestContextInfo() {
   // Request token counts for each option from VS Code
   chrome.runtime.sendMessage({ type: 'GET_CONTEXT_INFO' }, (response) => {
     if (response?.contextInfo) {
-      // Update token counts in mentionOptions
+      // Update token counts and labels in mentionOptions
       for (const [id, info] of Object.entries(response.contextInfo)) {
         const opt = mentionOptions.find(o => o.id === id);
-        if (opt && info.tokens !== undefined) {
-          opt.tokens = info.tokens;
+        if (opt) {
+          if (info.tokens !== undefined) {
+            opt.tokens = info.tokens;
+          }
+          // Update label for focused-file to show actual filename
+          if (id === 'focused-file' && info.label) {
+            opt.label = `Focused File (${info.label})`;
+            opt.description = info.label;
+          }
         }
       }
       updateMentionOptions();

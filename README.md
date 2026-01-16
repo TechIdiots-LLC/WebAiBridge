@@ -29,7 +29,7 @@ The extensions communicate via a local WebSocket connection (ports 64923-64932),
 **Option A: From Release**
 ```bash
 # Download the .vsix from GitHub Releases, then:
-code --install-extension webaibridge-0.5.0.vsix
+code --install-extension webaibridge-0.6.0.vsix
 ```
 
 **Option B: Build from Source**
@@ -57,13 +57,7 @@ code --install-extension webaibridge-*.vsix
 ## Usage
 
 ### @ Mentions (in AI Chat)
-Type a trigger in any supported AI chat input:
-
-**Triggers by site:**
-| Site | Trigger | Notes |
-|------|---------|-------|
-| ChatGPT, Claude, Gemini, AI Studio | `@` or `#` | Standard |
-| Microsoft Copilot | `//` or `/wab` | Copilot reserves `@` for its own menu |
+Type a trigger in any supported AI chat input. The trigger character is customizable in the popup (default: `@`).
 
 **Available context:**
 | Trigger | Description |

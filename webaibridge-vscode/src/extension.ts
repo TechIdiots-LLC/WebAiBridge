@@ -567,13 +567,17 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Handle @ mention context info requests (for showing token counts)
   async function handleContextInfoRequest(ws: any, requestId: string) {
-    const contextInfo: { [key: string]: { tokens: number } } = {};
+    const contextInfo: { [key: string]: { tokens: number; label?: string } } = {};
     
     try {
       // Focused file
       const editor = vscode.window.activeTextEditor;
       if (editor) {
-        contextInfo['focused-file'] = { tokens: Math.ceil(editor.document.getText().length / 4) };
+        const filename = path.basename(editor.document.fileName);
+        contextInfo['focused-file'] = { 
+          tokens: Math.ceil(editor.document.getText().length / 4),
+          label: filename
+        };
       }
       
       // Selection
