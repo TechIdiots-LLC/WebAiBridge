@@ -31,7 +31,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: master
-      - name: Setup node env 
+      - name: Setup node env
         uses: actions/setup-node@v6
         with:
           node-version-file: 'package.json'
