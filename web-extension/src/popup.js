@@ -263,12 +263,31 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
+// Load and save trigger character setting
+function loadTriggerSetting() {
+  chrome.storage.local.get(['triggerChar'], (res) => {
+    const trigger = res?.triggerChar || '@';
+    const input = document.getElementById('triggerChar');
+    if (input) input.value = trigger;
+  });
+}
+
+document.getElementById('triggerChar')?.addEventListener('input', (e) => {
+  let trigger = e.target.value.trim();
+  // Default to @ if empty
+  if (!trigger) trigger = '@';
+  chrome.storage.local.set({ triggerChar: trigger }, () => {
+    console.log('Trigger character saved:', trigger);
+  });
+});
+
 // Initial load
 updateBridgeStatus();
 updateInstances();
 updateChips();
 updateStats();
 loadLimitSettings();
+loadTriggerSetting();
 
 // Periodic refresh
 setInterval(() => { 

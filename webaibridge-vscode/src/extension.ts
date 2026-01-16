@@ -337,10 +337,16 @@ export function activate(context: vscode.ExtensionContext) {
       const editor = vscode.window.activeTextEditor;
       // If there is an active editor with a file, open a diff view between AI response and current file
       if (editor && !editor.document.isUntitled && editor.document.uri.scheme === 'file') {
-        // Extract code block if present; prefer first fenced block
+        // Extract code block(s) if present; prefer fenced blocks. If multiple blocks exist, join them.
         const codeBlockRegex = /```(?:([\w-+.]+))?\s*([\s\S]*?)```/g;
         const matches = [...text.matchAll(codeBlockRegex)];
-        const cleanCode = matches.length > 0 ? matches[0][2].trim() : text;
+        let cleanCode = text;
+        if (matches.length > 0) {
+          // Use language hint from first block if present
+          cleanCode = matches.length === 1
+            ? matches[0][2].trim()
+            : matches.map(m => m[2].trim()).join('\n\n');
+        }
 
         // Use active editor language as hint
         const lang = editor.document.languageId || undefined;

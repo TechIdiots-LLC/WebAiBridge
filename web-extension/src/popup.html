@@ -134,6 +134,16 @@
     <div style="margin:6px 0;align-items:center">
       <label><input type="checkbox" id="autoInsert"> Auto-insert into focused field</input></label>
     </div>
+    
+    <!-- Trigger Character Setting -->
+    <div class="instance-section" style="margin-top:8px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <label for="triggerChar" style="font-size:13px;font-weight:500">Mention trigger:</label>
+        <input type="text" id="triggerChar" maxlength="3" style="padding:4px;width:50px;text-align:center;font-family:monospace" value="@">
+      </div>
+      <div style="font-size:11px;color:#666">Character(s) to trigger the context menu (default: @)</div>
+    </div>
+    
     <script src="tokenizer.js"></script>
     <script src="popup.js"></script>
   </body>

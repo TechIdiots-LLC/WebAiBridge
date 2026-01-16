@@ -1,5 +1,94 @@
 ﻿console.debug("WebAiBridge content script loaded on", location.href);
 
+// ==================== Shadow DOM Deep Query Helpers ====================
+// For Copilot and other sites that use shadow DOM
+
+function querySelectorAllDeep(selector, root = document) {
+  const out = [];
+  const visit = (node) => {
+    if (!node) return;
+    if (node.querySelectorAll) {
+      node.querySelectorAll(selector).forEach(el => out.push(el));
+    }
+    // Also check shadow roots
+    const elements = node.querySelectorAll ? node.querySelectorAll('*') : [];
+    for (const el of elements) {
+      if (el.shadowRoot) visit(el.shadowRoot);
+    }
+  };
+  visit(root);
+  return out;
+}
+
+function querySelectorDeep(selector, root = document) {
+  return querySelectorAllDeep(selector, root)[0] || null;
+}
+
+// ==================== Modern Input API Helpers ====================
+// Use beforeinput + Range instead of deprecated execCommand
+
+function insertTextIntoCE(target, text) {
+  if (!target) return false;
+  target.focus();
+  
+  // Try modern beforeinput path first
+  try {
+    const ev = new InputEvent('beforeinput', {
+      inputType: 'insertText',
+      data: text,
+      bubbles: true,
+      cancelable: true,
+      composed: true
+    });
+    const accepted = target.dispatchEvent(ev);
+    if (!accepted) {
+      // Editor consumed the event
+      return true;
+    }
+  } catch (e) {
+    console.debug('[WebAiBridge] beforeinput not supported:', e);
+  }
+  
+  // Range insertion fallback
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount > 0) {
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    const node = document.createTextNode(text);
+    range.insertNode(node);
+    range.setStartAfter(node);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    target.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }
+  return false;
+}
+
+function insertTextModern(target, text) {
+  if (!target) {
+    target = document.activeElement || findChatInput();
+  }
+  if (!target) return false;
+  
+  if (target.isContentEditable) {
+    return insertTextIntoCE(target, text);
+  }
+  
+  if ('value' in target) {
+    const start = target.selectionStart ?? target.value.length;
+    const end = target.selectionEnd ?? target.value.length;
+    const v = target.value;
+    target.value = v.slice(0, start) + text + v.slice(end);
+    const pos = start + text.length;
+    try { target.setSelectionRange(pos, pos); } catch (e) {}
+    target.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }
+  return false;
+}
+
 // Track the last focused input field before overlay appears
 let lastFocusedInput = null;
 
@@ -7,6 +96,9 @@ let lastFocusedInput = null;
 let mentionPopover = null;
 let mentionQuery = '';
 let mentionStartPos = -1;
+let mentionRange = null; // Store the actual Range where trigger was typed
+let mentionTriggerOffset = -1; // Offset of the trigger character in the full text
+let mentionFullTextAtTrigger = ''; // Snapshot of full text when trigger was detected
 let selectedMentionIndex = 0;
 
 // Inserted context tracking (for chip bar display)
@@ -59,7 +151,7 @@ const SITE_CONFIG = {
   copilot: {
     hostPatterns: ['m365.cloud.microsoft.com', 'copilot.microsoft.com'],
     inputSelectors: ['textarea[placeholder*="Message"]', 'div[contenteditable="true"][data-placeholder]', 'textarea', 'div[contenteditable="true"]'],
-    triggers: ['//', '/wab', '@'],
+    triggers: ['@', '#'],
     sendButtonSelectors: ['button[aria-label*="Send"]', 'button[data-testid*="send"]']
   }
 };
@@ -80,6 +172,29 @@ function getSiteConfig(siteKey) {
 function findChatInput() {
   const site = detectSite();
   const cfg = getSiteConfig(site);
+  
+  // For Copilot, use shadow DOM aware deep queries with ARIA-first approach
+  if (site === 'copilot') {
+    // Prefer ARIA role="textbox" + contenteditable (works across languages)
+    const ce = querySelectorDeep('[role="textbox"][contenteditable="true"][aria-multiline="true"]');
+    if (ce) return ce;
+    
+    // Try known selectors with deep query
+    for (const selector of (cfg?.inputSelectors || [])) {
+      try {
+        const el = querySelectorDeep(selector);
+        if (el) return el;
+      } catch (e) {}
+    }
+    
+    // Fallbacks for Copilot variants
+    return querySelectorDeep('div[contenteditable="true"][data-placeholder]') ||
+           querySelectorDeep('div[contenteditable="true"][aria-label]') ||
+           querySelectorDeep('textarea[aria-label]') ||
+           querySelectorDeep('div[contenteditable="true"]') ||
+           querySelectorDeep('textarea');
+  }
+  
   if (!cfg) {
     // Generic fallback
     return document.querySelector('textarea') || document.querySelector('div[contenteditable="true"]') || document.querySelector('input[type="text"]');
@@ -548,24 +663,40 @@ let selectionCounter = 0;
 // Track used placeholders to handle duplicates
 let usedPlaceholders = {};
 
-// More robust placeholder wrappers to avoid accidental collisions
+// Placeholder formats:
+// Standard (Gemini, Claude, ChatGPT): Uses zero-width chars for invisibility
+// Copilot: Uses visible [[WAB::id::label]] format that survives sanitization
 const PLACEHOLDER_PREFIX = '\u200B\u200C'; // ZWSP + ZWNJ
 const PLACEHOLDER_SUFFIX = '\u200C\u200B'; // ZWNJ + ZWSP
+const WAB_TOK_PREFIX = '[[WAB::';
+const WAB_TOK_SUFFIX = ']]';
 
 function createSecurePlaceholder(label) {
+  const site = detectSite();
   const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID().slice(0,8) : Date.now().toString(36);
   // Sanitize label (remove spaces/brackets)
   const safeLabel = String(label || '').replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0,40);
+  
+  // For Copilot, use visible [[WAB::id::label]] format that won't be stripped
+  if (site === 'copilot') {
+    return `${WAB_TOK_PREFIX}${id}::${safeLabel}${WAB_TOK_SUFFIX}`;
+  }
+  
+  // For other sites, use zero-width wrapper
   return `${PLACEHOLDER_PREFIX}@${safeLabel}[${id}]${PLACEHOLDER_SUFFIX}`;
 }
 
-function insertInlineChip(optionId, label, tokens, inputElement, content) {
-  // Ensure any typed trigger (e.g. @, #, //, /wab) immediately before the cursor is removed
-  try {
-    removeTriggerBeforeCursor(inputElement);
-  } catch (e) {
-    console.debug('removeTriggerBeforeCursor failed', e);
-  }
+// Check if a placeholder matches our format (either standard or Copilot)
+function isValidPlaceholder(text) {
+  if (!text || typeof text !== 'string') return false;
+  // Standard format
+  if (text.startsWith(PLACEHOLDER_PREFIX) && text.endsWith(PLACEHOLDER_SUFFIX)) return true;
+  // Copilot format
+  if (text.startsWith(WAB_TOK_PREFIX) && text.endsWith(WAB_TOK_SUFFIX)) return true;
+  return false;
+}
+
+function insertInlineChip(optionId, label, tokens, inputElement, content, savedRange = null, savedQuery = '') {
   const uniqueId = `wab-${optionId}-${Date.now()}`;
   
   // Generate an appropriate placeholder based on context type
@@ -609,7 +740,9 @@ function insertInlineChip(optionId, label, tokens, inputElement, content) {
     tokens,
     contentLength: content?.length,
     placeholder,
-    uniqueId
+    uniqueId,
+    hasSavedRange: !!savedRange,
+    savedQuery
   });
   
   // Create a secure, hard-to-accidentally-type placeholder token
@@ -635,34 +768,166 @@ function insertInlineChip(optionId, label, tokens, inputElement, content) {
   });
   console.debug('[WebAiBridge] insertedContexts now has', insertedContexts.length, 'entries');
   
-  // Insert the readable placeholder text into the input
-    if (inputElement.isContentEditable) {
-    // For contenteditable, insert the placeholder text
-    const sel = window.getSelection();
-    if (sel && sel.rangeCount > 0) {
-      const range = sel.getRangeAt(0);
-      range.deleteContents();
-        // Insert the wrapped placeholder so that expansion only matches our chip
-        const textNode = document.createTextNode(wrappedPlaceholder + ' ');
-        range.insertNode(textNode);
-        range.setStartAfter(textNode);
-        range.setEndAfter(textNode);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      console.debug('[WebAiBridge] Inserted placeholder text at cursor');
-    } else {
-      // Fallback: append to end
-        inputElement.appendChild(document.createTextNode(wrappedPlaceholder + ' '));
-      console.debug('[WebAiBridge] Appended placeholder to end');
+  // Insert the placeholder text, replacing the trigger
+  if (inputElement.isContentEditable) {
+    let inserted = false;
+    const site = detectSite();
+    
+    // Focus the input first to ensure we can manipulate it
+    inputElement.focus();
+    
+    // Get the current text and find the trigger based on setting
+    const currentText = inputElement.innerText || inputElement.textContent || '';
+    const triggerSetting = cachedTriggerChar || '@';
+    
+    // Build trigger pattern - the trigger followed by optional query
+    const triggerWithQuery = savedQuery ? `${triggerSetting}${savedQuery}` : triggerSetting;
+    
+    // For Copilot: use text replacement approach that doesn't rely on Range API
+    if (site === 'copilot') {
+      try {
+        // Find the trigger in the text
+        const triggerIdx = currentText.lastIndexOf(triggerWithQuery);
+        
+        if (triggerIdx >= 0) {
+          const triggerLen = triggerSetting.length + (savedQuery ? savedQuery.length : 0);
+          const before = currentText.slice(0, triggerIdx);
+          const after = currentText.slice(triggerIdx + triggerLen);
+          const newText = before + wrappedPlaceholder + ' ' + after;
+          
+          // Use Range to select all and replace with modern API
+          const range = document.createRange();
+          range.selectNodeContents(inputElement);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          
+          // Use insertTextIntoCE for proper editor integration
+          insertTextIntoCE(inputElement, newText);
+          
+          // Try to position cursor at the right place
+          setTimeout(() => {
+            try {
+              const newSel = window.getSelection();
+              if (newSel.rangeCount > 0) {
+                const newRange = newSel.getRangeAt(0);
+                const targetPos = triggerIdx + wrappedPlaceholder.length + 1;
+                // Walk to find position
+                const walker = document.createTreeWalker(inputElement, NodeFilter.SHOW_TEXT, null, false);
+                let charCount = 0;
+                while (walker.nextNode()) {
+                  const node = walker.currentNode;
+                  const nodeLen = (node.textContent || '').length;
+                  if (charCount + nodeLen >= targetPos) {
+                    newRange.setStart(node, Math.min(targetPos - charCount, nodeLen));
+                    newRange.collapse(true);
+                    newSel.removeAllRanges();
+                    newSel.addRange(newRange);
+                    break;
+                  }
+                  charCount += nodeLen;
+                }
+              }
+            } catch (e) {
+              console.debug('[WebAiBridge] Cursor positioning failed', e);
+            }
+          }, 10);
+          
+          inserted = true;
+          console.debug('[WebAiBridge] Inserted placeholder via Copilot text replacement');
+        }
+      } catch (e) {
+        console.debug('[WebAiBridge] Copilot text replacement failed', e);
+      }
     }
-    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+    
+    // Strategy: Walk the DOM to find the trigger character, then use Range API
+    if (!inserted) {
+      const triggerLength = triggerSetting.length + (savedQuery ? savedQuery.length : 0);
+      
+      try {
+        // Walk through text nodes to find the trigger
+        const walker = document.createTreeWalker(inputElement, NodeFilter.SHOW_TEXT, null, false);
+        let foundNode = null;
+        let foundOffset = -1;
+        
+        // Escape special regex characters in the trigger
+        const escapedTrigger = triggerSetting.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        
+        while (walker.nextNode()) {
+          const node = walker.currentNode;
+          const text = node.textContent || '';
+          
+          // Look for trigger followed by the query (if any)
+          const triggerPattern = savedQuery ? 
+            new RegExp(`${escapedTrigger}${savedQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) :
+            new RegExp(`${escapedTrigger}$`);
+          
+          const match = text.match(triggerPattern);
+          if (match) {
+            foundNode = node;
+            foundOffset = match.index;
+            break;
+          }
+        }
+        
+        if (foundNode && foundOffset >= 0) {
+          const sel = window.getSelection();
+          const range = document.createRange();
+          
+          // Select from trigger to end of trigger+query
+          range.setStart(foundNode, foundOffset);
+          range.setEnd(foundNode, foundOffset + triggerLength);
+          
+          // Delete the trigger and query
+          range.deleteContents();
+          
+          // Insert the placeholder
+          const textNode = document.createTextNode(wrappedPlaceholder + ' ');
+          range.insertNode(textNode);
+          
+          // Position cursor after the inserted text
+          range.setStartAfter(textNode);
+          range.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          
+          inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+          inserted = true;
+          console.debug('[WebAiBridge] Inserted placeholder via TreeWalker + Range API');
+        }
+      } catch (e) {
+        console.debug('[WebAiBridge] TreeWalker + Range insertion failed', e);
+      }
+    }
+    
+    // Final fallback: just append
+    if (!inserted) {
+      insertIntoContentEditable(inputElement, wrappedPlaceholder + ' ');
+      inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+      console.debug('[WebAiBridge] Inserted placeholder via fallback append');
+    }
   } else {
     // For textarea/input
-      const start = inputElement.selectionStart || inputElement.value.length;
-      const val = inputElement.value;
-      inputElement.value = val.slice(0, start) + wrappedPlaceholder + ' ' + val.slice(start);
-      const newPos = start + wrappedPlaceholder.length + 1;
-    inputElement.setSelectionRange(newPos, newPos);
+    const val = inputElement.value || '';
+    const pos = inputElement.selectionStart || val.length;
+    const before = val.slice(0, pos);
+    
+    // Find trigger based on setting
+    const triggerSetting = cachedTriggerChar || '@';
+    const atIdx = before.lastIndexOf(triggerSetting);
+    
+    if (atIdx >= 0) {
+      // Replace from trigger to cursor with placeholder
+      inputElement.value = before.slice(0, atIdx) + wrappedPlaceholder + ' ' + val.slice(pos);
+      const newPos = atIdx + wrappedPlaceholder.length + 1;
+      inputElement.setSelectionRange(newPos, newPos);
+    } else {
+      // Just insert at cursor
+      inputElement.value = val.slice(0, pos) + wrappedPlaceholder + ' ' + val.slice(pos);
+      const newPos = pos + wrappedPlaceholder.length + 1;
+      inputElement.setSelectionRange(newPos, newPos);
+    }
     inputElement.dispatchEvent(new Event('input', { bubbles: true }));
     console.debug('[WebAiBridge] Inserted placeholder in textarea');
   }
@@ -679,54 +944,60 @@ function removeTriggerBeforeCursor(element) {
 
   if (!element) return;
 
+  // Handle textarea/input elements
   if ('value' in element && element.tagName !== 'DIV') {
     const val = element.value;
     const pos = element.selectionStart || val.length;
-    // Look backwards for copilot tokens or @/#
+    const before = val.slice(0, pos);
+    
+    // Look for copilot triggers first
     if (site === 'copilot') {
-      const before = val.slice(0, pos);
       if (before.endsWith('/wab')) {
-        const newVal = val.slice(0, pos - 4) + val.slice(pos);
-        element.value = newVal;
+        element.value = val.slice(0, pos - 4) + val.slice(pos);
         element.setSelectionRange(pos - 4, pos - 4);
         element.dispatchEvent(new Event('input', { bubbles: true }));
         return;
       }
       if (before.endsWith('//')) {
-        const newVal = val.slice(0, pos - 2) + val.slice(pos);
-        element.value = newVal;
+        element.value = val.slice(0, pos - 2) + val.slice(pos);
         element.setSelectionRange(pos - 2, pos - 2);
         element.dispatchEvent(new Event('input', { bubbles: true }));
         return;
       }
     }
 
-    // Default: remove last @ or # immediately before cursor (and any following query chars)
-    const before = val.slice(0, pos);
+    // Default: remove @ or # and everything after it up to cursor
     const atIdx = Math.max(before.lastIndexOf('@'), before.lastIndexOf('#'));
     if (atIdx >= 0) {
-      // remove from atIdx up to cursor
-      const newVal = before.slice(0, atIdx) + val.slice(pos);
-      element.value = newVal;
+      element.value = before.slice(0, atIdx) + val.slice(pos);
       element.setSelectionRange(atIdx, atIdx);
       element.dispatchEvent(new Event('input', { bubbles: true }));
     }
-  } else if (element.isContentEditable) {
+    return;
+  }
+  
+  // Handle contentEditable elements (Gemini, Claude, etc.)
+  if (element.isContentEditable) {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0) return;
+    
     const range = sel.getRangeAt(0);
     const container = range.startContainer;
+    
+    // Case 1: Cursor is inside a text node (most common for Gemini/Quill)
     if (container.nodeType === Node.TEXT_NODE) {
       const txt = container.textContent || '';
       const offset = range.startOffset;
+      const before = txt.slice(0, offset);
+      
+      // Check for copilot triggers
       if (site === 'copilot') {
-        const before = txt.slice(0, offset).toLowerCase();
-        const wabIdx = before.lastIndexOf('/wab');
-        const slashIdx = before.lastIndexOf('//');
+        const beforeLower = before.toLowerCase();
+        const wabIdx = beforeLower.lastIndexOf('/wab');
+        const slashIdx = beforeLower.lastIndexOf('//');
         const idx = Math.max(wabIdx, slashIdx);
         if (idx >= 0) {
-          const newText = txt.slice(0, idx) + txt.slice(offset);
-          container.textContent = newText;
+          container.textContent = txt.slice(0, idx) + txt.slice(offset);
           const newRange = document.createRange();
           newRange.setStart(container, idx);
           newRange.collapse(true);
@@ -735,70 +1006,12 @@ function removeTriggerBeforeCursor(element) {
           element.dispatchEvent(new Event('input', { bubbles: true }));
           return;
         }
-      } else {
-        // Fallback for rich editors where cursor container is not a text node.
-        try {
-          const fullText = element.innerText || element.textContent || '';
-          const preRange = document.createRange();
-          preRange.setStart(element, 0);
-          preRange.setEnd(range.startContainer, range.startOffset);
-          const beforeText = preRange.toString();
-          const offset = beforeText.length;
-
-          if (site === 'copilot') {
-            const beforeLower = beforeText.toLowerCase();
-            const wabIdx = beforeLower.lastIndexOf('/wab');
-            const slashIdx = beforeLower.lastIndexOf('//');
-            const idx = Math.max(wabIdx, slashIdx);
-            if (idx >= 0) {
-              const afterText = fullText.slice(offset);
-              const newText = fullText.slice(0, idx) + afterText;
-              element.innerText = newText;
-              // Place caret at idx
-              const sel2 = window.getSelection();
-              const newRange2 = document.createRange();
-              const textNode = element.firstChild;
-              if (textNode && textNode.nodeType === Node.TEXT_NODE) {
-                const pos = Math.min(idx, textNode.textContent.length);
-                newRange2.setStart(textNode, pos);
-                newRange2.collapse(true);
-                sel2.removeAllRanges();
-                sel2.addRange(newRange2);
-              }
-              element.dispatchEvent(new Event('input', { bubbles: true }));
-              return;
-            }
-          }
-
-          // Default: find last @ or # before caret
-          const atIdx = Math.max(beforeText.lastIndexOf('@'), beforeText.lastIndexOf('#'));
-          if (atIdx >= 0) {
-            const afterText = fullText.slice(offset);
-            const newText = fullText.slice(0, atIdx) + afterText;
-            element.innerText = newText;
-            const sel2 = window.getSelection();
-            const newRange2 = document.createRange();
-            const textNode = element.firstChild;
-            if (textNode && textNode.nodeType === Node.TEXT_NODE) {
-              const pos = Math.min(atIdx, textNode.textContent.length);
-              newRange2.setStart(textNode, pos);
-              newRange2.collapse(true);
-              sel2.removeAllRanges();
-              sel2.addRange(newRange2);
-            }
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-        } catch (e) {
-          console.debug('contenteditable fallback removal failed', e);
-        }
       }
-
-      // Default: remove last @ or # and any query upto cursor
-      const before = txt.slice(0, offset);
+      
+      // Default: find and remove @ or # trigger
       const atIdx = Math.max(before.lastIndexOf('@'), before.lastIndexOf('#'));
       if (atIdx >= 0) {
-        const newText = txt.slice(0, atIdx) + txt.slice(offset);
-        container.textContent = newText;
+        container.textContent = txt.slice(0, atIdx) + txt.slice(offset);
         const newRange = document.createRange();
         newRange.setStart(container, atIdx);
         newRange.collapse(true);
@@ -806,7 +1019,60 @@ function removeTriggerBeforeCursor(element) {
         sel.addRange(newRange);
         element.dispatchEvent(new Event('input', { bubbles: true }));
       }
+      return;
     }
+    
+    // Case 2: Cursor is NOT in a text node (some editors like ProseMirror)
+    // Use Range API to compute text offset from start of element
+    try {
+      const preRange = document.createRange();
+      preRange.setStart(element, 0);
+      preRange.setEnd(range.startContainer, range.startOffset);
+      const beforeText = preRange.toString();
+      const caretOffset = beforeText.length;
+      const fullText = element.innerText || element.textContent || '';
+      
+      // Check copilot triggers
+      if (site === 'copilot') {
+        const beforeLower = beforeText.toLowerCase();
+        const wabIdx = beforeLower.lastIndexOf('/wab');
+        const slashIdx = beforeLower.lastIndexOf('//');
+        const idx = Math.max(wabIdx, slashIdx);
+        if (idx >= 0) {
+          const newText = fullText.slice(0, idx) + fullText.slice(caretOffset);
+          // Use textContent to preserve structure better than innerText
+          element.textContent = newText;
+          setCaretPosition(element, idx);
+          element.dispatchEvent(new Event('input', { bubbles: true }));
+          return;
+        }
+      }
+      
+      // Default: find and remove @ or #
+      const atIdx = Math.max(beforeText.lastIndexOf('@'), beforeText.lastIndexOf('#'));
+      if (atIdx >= 0) {
+        const newText = fullText.slice(0, atIdx) + fullText.slice(caretOffset);
+        element.textContent = newText;
+        setCaretPosition(element, atIdx);
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    } catch (e) {
+      console.debug('contenteditable non-text-node removal failed', e);
+    }
+  }
+}
+
+// Helper to set caret position in a contentEditable element
+function setCaretPosition(element, position) {
+  const sel = window.getSelection();
+  const textNode = element.firstChild;
+  if (textNode && textNode.nodeType === Node.TEXT_NODE) {
+    const pos = Math.min(position, textNode.textContent.length);
+    const range = document.createRange();
+    range.setStart(textNode, pos);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
   }
 }
 
@@ -873,8 +1139,8 @@ function expandChipsToContent(element) {
     const placeholder = ctx.placeholder;
     const content = contextContents[placeholder] || ctx.content || '';
 
-    // Validate placeholder format (secure wrapper) before expanding
-    if (typeof placeholder === 'string' && placeholder.startsWith(PLACEHOLDER_PREFIX) && placeholder.endsWith(PLACEHOLDER_SUFFIX) && content) {
+    // Validate placeholder format (standard or Copilot format) before expanding
+    if (typeof placeholder === 'string' && isValidPlaceholder(placeholder) && content) {
       if (text.includes(placeholder)) {
         console.debug('[WebAiBridge] Expanding placeholder:', placeholder, '→', content.length, 'chars');
         text = text.split(placeholder).join(content);
@@ -884,9 +1150,28 @@ function expandChipsToContent(element) {
     }
   });
   
-  // Update the element
+  const site = detectSite();
+  
+  // Update the element - use modern APIs for contenteditable to avoid destroying structure
   if (element.isContentEditable) {
-    element.innerText = text;
+    // For Copilot/Quill editors, use Range-based replacement instead of innerText
+    if (site === 'copilot' || site === 'gemini') {
+      try {
+        // Select all content and replace
+        element.focus();
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        insertTextIntoCE(element, text);
+      } catch (e) {
+        console.debug('[WebAiBridge] Range replacement failed, falling back to innerText', e);
+        element.innerText = text;
+      }
+    } else {
+      element.innerText = text;
+    }
   } else {
     element.value = text;
   }
@@ -903,7 +1188,6 @@ function expandChipsToContent(element) {
   element.dispatchEvent(new Event('change', { bubbles: true }));
   
   // For ProseMirror/Quill editors (Gemini, Claude), also dispatch textInput
-  const site = detectSite();
   if (site === 'gemini' || site === 'claude') {
     try {
       const textInputEvent = new InputEvent('textInput', {
@@ -933,7 +1217,51 @@ function addContextChip(optionId, label, tokens, inputElement, content = '', ins
  * Show/update the context chip bar above the input
  */
 let chipBarResizeObserver = null;
+let chipBarMutationObserver = null;
 let chipBarInputElement = null;
+let chipBarPositionInterval = null;
+
+/**
+ * Sync insertedContexts with the actual text content.
+ * Removes chips whose placeholders are no longer in the text.
+ */
+function syncChipsWithText(inputElement) {
+  if (!inputElement || insertedContexts.length === 0) return;
+  
+  // Get current text from the input
+  let currentText = '';
+  if ('value' in inputElement && inputElement.tagName !== 'DIV') {
+    currentText = inputElement.value || '';
+  } else if (inputElement.isContentEditable) {
+    currentText = inputElement.innerText || inputElement.textContent || '';
+  }
+  
+  // Check each inserted context to see if its placeholder is still present
+  const beforeCount = insertedContexts.length;
+  const removedPlaceholders = [];
+  
+  insertedContexts = insertedContexts.filter(ctx => {
+    const isPresent = currentText.includes(ctx.placeholder);
+    if (!isPresent) {
+      removedPlaceholders.push(ctx.placeholder);
+      // Clean up contextContents as well
+      delete contextContents[ctx.placeholder];
+    }
+    return isPresent;
+  });
+  
+  const afterCount = insertedContexts.length;
+  
+  if (beforeCount !== afterCount) {
+    console.debug(`[WebAiBridge] Synced chips: removed ${beforeCount - afterCount} orphaned chips`, removedPlaceholders);
+    // Update the chip bar
+    if (insertedContexts.length === 0) {
+      hideContextChipBar();
+    } else {
+      showContextChipBar(inputElement);
+    }
+  }
+}
 
 function updateChipBarPosition() {
   if (!contextChipBar || !chipBarInputElement) return;
@@ -959,21 +1287,45 @@ function showContextChipBar(inputElement) {
     contextChipBar.id = 'webaibridge-chip-bar';
     document.body.appendChild(contextChipBar);
     
-    // Set up ResizeObserver to handle window/sidebar resizing
+    // Set up ResizeObserver to handle input/container resizing
     if (typeof ResizeObserver !== 'undefined') {
       chipBarResizeObserver = new ResizeObserver(() => {
         updateChipBarPosition();
       });
       
-      // Observe the input element's parent container for size changes
+      // Observe the input element itself for size changes
+      if (inputElement) {
+        chipBarResizeObserver.observe(inputElement);
+      }
+      
+      // Also observe the parent container for size changes
       const container = inputElement?.closest('form') || inputElement?.parentElement;
       if (container) {
         chipBarResizeObserver.observe(container);
       }
     }
     
-    // Also update on window resize
+    // Set up MutationObserver to detect DOM changes that might affect position
+    if (typeof MutationObserver !== 'undefined' && inputElement) {
+      chipBarMutationObserver = new MutationObserver(() => {
+        updateChipBarPosition();
+      });
+      
+      // Observe changes to the input element's attributes and subtree
+      chipBarMutationObserver.observe(inputElement, {
+        attributes: true,
+        attributeFilter: ['style', 'class'],
+        childList: true,
+        subtree: true
+      });
+    }
+    
+    // Also update on window resize and scroll
     window.addEventListener('resize', updateChipBarPosition);
+    window.addEventListener('scroll', updateChipBarPosition, true);
+    
+    // Polling fallback for cases where observers don't catch changes (e.g., Gemini's dynamic resizing)
+    chipBarPositionInterval = setInterval(updateChipBarPosition, 500);
   }
   
   // Calculate total tokens
@@ -1096,9 +1448,20 @@ function showContextChipBar(inputElement) {
       };
       
       const tokenText = ctx.tokens ? `${Tokenizer.formatTokenCount(ctx.tokens)}` : '';
+      
+      // Extract the short ID from the placeholder
+      // Standard format: "@_focused-file[0de8e5ab]" -> "0de8e5ab"
+      // Copilot format: "[[WAB::0de8e5ab::focused-file]]" -> "0de8e5ab"
+      let shortId = '';
+      const stdMatch = ctx.placeholder.match(/\[([a-f0-9]+)\]/i);
+      const wabMatch = ctx.placeholder.match(/\[\[WAB::([a-f0-9]+)::/i);
+      if (stdMatch) shortId = stdMatch[1];
+      else if (wabMatch) shortId = wabMatch[1];
+      const displayLabel = shortId ? `${ctx.label} <span style="color:#888;font-size:10px">${shortId}</span>` : ctx.label;
+      
       chip.innerHTML = `
         <span style="font-size:16px">${ctx.icon}</span>
-        <span style="color:#9cdcfe;font-weight:500">${ctx.label}</span>
+        <span style="color:#9cdcfe;font-weight:500">${displayLabel}</span>
         <span style="
           background: #404040;
           color: #4ec9b0;
@@ -1337,8 +1700,21 @@ function hideContextChipBar() {
     chipBarResizeObserver = null;
   }
   
+  // Clean up MutationObserver
+  if (chipBarMutationObserver) {
+    chipBarMutationObserver.disconnect();
+    chipBarMutationObserver = null;
+  }
+  
+  // Clean up polling interval
+  if (chipBarPositionInterval) {
+    clearInterval(chipBarPositionInterval);
+    chipBarPositionInterval = null;
+  }
+  
   chipBarInputElement = null;
   window.removeEventListener('resize', updateChipBarPosition);
+  window.removeEventListener('scroll', updateChipBarPosition, true);
 }
 
 // ==================== @ Mention Popover ====================
@@ -1513,6 +1889,9 @@ function removeMentionPopover() {
   }
   mentionQuery = '';
   mentionStartPos = -1;
+  mentionRange = null;
+  mentionTriggerOffset = -1;
+  mentionFullTextAtTrigger = '';
   selectedMentionIndex = 0;
   // Reset file picker state when popover closes
   isFilePickerMode = false;
@@ -1576,6 +1955,9 @@ function selectMentionOption(optionId) {
   const savedStartPos = mentionStartPos;
   const savedQuery = mentionQuery;
   const savedInput = inputElement;
+  const savedRange = mentionRange ? mentionRange.cloneRange() : null; // Clone the stored Range
+  const savedTriggerOffset = mentionTriggerOffset;
+  const savedFullText = mentionFullTextAtTrigger;
   
   // Handle file-picker trigger
   if (optionId === 'file-search') {
@@ -1591,59 +1973,57 @@ function selectMentionOption(optionId) {
     const fileEntry = workspaceFiles.find(f => f.path === filePath);
     if (!fileEntry) return;
 
-    // Remove the @query text first and close popover
-    removeAtQueryFromElement(inputElement, savedStartPos, savedQuery);
+    // Close popover (don't call removeAtQueryFromElement - insertInlineChip handles removal)
     removeMentionPopover();
 
     // Insert placeholder chip for the file and prefetch content asynchronously
     console.debug('Inserting file chip for:', fileEntry.label);
     showLoadingIndicator(savedInput);
-    savedInput.focus();
-    setTimeout(() => {
-      const uniqueId = insertInlineChip('file', fileEntry.label, null, savedInput, null);
-      // Find the inserted context and attach filePath
-      const ctx = insertedContexts.find(c => c.id === uniqueId);
-      if (ctx) {
-        ctx.filePath = fileEntry.path;
-        // Ensure mapping exists (may be null initially)
-        contextContents[ctx.placeholder] = contextContents[ctx.placeholder] || null;
-        // Prefetch file content from VS Code
-        chrome.runtime.sendMessage({ type: 'REQUEST_CONTEXT', contextType: 'file', filePath: fileEntry.path }, (resp) => {
-          hideLoadingIndicator();
-          if (!resp) {
-            console.debug('Empty response for file content', fileEntry.path);
-            return;
-          }
-
-          if (resp.stream && Array.isArray(resp.chunks)) {
-            // Assemble streamed chunks
-            try {
-              const joined = resp.chunks.map(c => c.text).join('');
-              const header = `/* FILE: ${fileEntry.label} (${fileEntry.languageId || 'file'}) */\n`;
-              contextContents[ctx.placeholder] = header + joined;
-              ctx.tokens = estimateTokens(contextContents[ctx.placeholder]);
-              showContextChipBar(savedInput);
-            } catch (e) {
-              console.debug('Failed to assemble streamed file chunks', e);
-            }
-          } else if (resp?.text) {
-            contextContents[ctx.placeholder] = resp.text;
-            ctx.tokens = estimateTokens(resp.text);
-            showContextChipBar(savedInput);
-          } else {
-            console.debug('File content not returned for', fileEntry.path, resp);
-          }
-        });
-      } else {
+    
+    // Insert chip immediately using saved position info
+    const uniqueId = insertInlineChip('file', fileEntry.label, null, savedInput, null, savedRange, savedQuery);
+    
+    // Find the inserted context and attach filePath
+    const ctx = insertedContexts.find(c => c.id === uniqueId);
+    if (ctx) {
+      ctx.filePath = fileEntry.path;
+      // Ensure mapping exists (may be null initially)
+      contextContents[ctx.placeholder] = contextContents[ctx.placeholder] || null;
+      // Prefetch file content from VS Code
+      chrome.runtime.sendMessage({ type: 'REQUEST_CONTEXT', contextType: 'file', filePath: fileEntry.path }, (resp) => {
         hideLoadingIndicator();
-      }
-    }, 50);
+        if (!resp) {
+          console.debug('Empty response for file content', fileEntry.path);
+          return;
+        }
+
+        if (resp.stream && Array.isArray(resp.chunks)) {
+          // Assemble streamed chunks
+          try {
+            const joined = resp.chunks.map(c => c.text).join('');
+            const header = `/* FILE: ${fileEntry.label} (${fileEntry.languageId || 'file'}) */\n`;
+            contextContents[ctx.placeholder] = header + joined;
+            ctx.tokens = estimateTokens(contextContents[ctx.placeholder]);
+            showContextChipBar(savedInput);
+          } catch (e) {
+            console.debug('Failed to assemble streamed file chunks', e);
+          }
+        } else if (resp?.text) {
+          contextContents[ctx.placeholder] = resp.text;
+          ctx.tokens = estimateTokens(resp.text);
+          showContextChipBar(savedInput);
+        } else {
+          console.debug('File content not returned for', fileEntry.path, resp);
+        }
+      });
+    } else {
+      hideLoadingIndicator();
+    }
     return;
   }
 
-  // Default behavior: remove @query and request context from VS Code
-  // Remove the @query text first
-  removeAtQueryFromElement(inputElement, savedStartPos, savedQuery);
+  // Default behavior: request context from VS Code, insert chip using saved range
+  // Close popover (insertInlineChip handles removal using savedRange)
   removeMentionPopover();
   
   // Show loading indicator
@@ -1676,14 +2056,11 @@ function selectMentionOption(optionId) {
       
       switch (limitResult.action) {
         case 'insert':
-          // Insert inline chip (not raw text)
-          savedInput.focus();
-          setTimeout(() => {
-            insertInlineChip(optionId, chipLabel, limitResult.tokens, savedInput, contentToInsert);
-            if (limitResult.wasTruncated) {
-              showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
-            }
-          }, 50);
+          // Insert inline chip using saved position info
+          insertInlineChip(optionId, chipLabel, limitResult.tokens, savedInput, contentToInsert, savedRange, savedQuery);
+          if (limitResult.wasTruncated) {
+            showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
+          }
           break;
           
         case 'warn':
@@ -1693,10 +2070,7 @@ function selectMentionOption(optionId) {
             limitResult.limit,
             () => {
               // User chose to proceed - insert inline chip
-              savedInput.focus();
-              setTimeout(() => {
-                insertInlineChip(optionId, chipLabel, limitResult.tokens, savedInput, contentToInsert);
-              }, 50);
+              insertInlineChip(optionId, chipLabel, limitResult.tokens, savedInput, contentToInsert, savedRange, savedQuery);
             },
             () => {
               // User cancelled - do nothing
@@ -1937,6 +2311,28 @@ function handleMentionKeydown(e) {
   return false;
 }
 
+// Cached trigger setting
+let cachedTriggerChar = '@';
+
+// Load trigger setting from storage
+function loadTriggerSetting() {
+  chrome.storage.local.get(['triggerChar'], (res) => {
+    cachedTriggerChar = res?.triggerChar || '@';
+    console.debug('[WebAiBridge] Trigger character loaded:', cachedTriggerChar);
+  });
+}
+
+// Listen for storage changes to update trigger
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.triggerChar) {
+    cachedTriggerChar = changes.triggerChar.newValue || '@';
+    console.debug('[WebAiBridge] Trigger character updated:', cachedTriggerChar);
+  }
+});
+
+// Initial load
+loadTriggerSetting();
+
 function handleInputForMention(e) {
   const target = e.target;
   console.debug('[WebAiBridge] handleInputForMention called; target=', target, 'lastFocusedInput=', lastFocusedInput);
@@ -1969,24 +2365,28 @@ function handleInputForMention(e) {
   
   const textBeforeCursor = text.slice(0, cursorPos);
   
-  // Site-specific trigger patterns:
-  // - Copilot uses @ for its own menu, so we use // or /wab as trigger
-  // - Claude's ProseMirror can be finicky, also support # as fallback
-  // - Default: @ or #
+  // Build trigger pattern based on custom setting (default: @)
   let triggerMatch = null;
+  const triggerSetting = cachedTriggerChar || '@';
   
-  if (site === 'copilot') {
-    // For Copilot: use // or /wab as trigger (since @ is taken)
-    triggerMatch = textBeforeCursor.match(/\/\/(\w*)$/) || 
-                   textBeforeCursor.match(/\/wab\s*(\w*)$/i);
-  } else {
-    // For other sites: @ or # as trigger
-    triggerMatch = textBeforeCursor.match(/[@#](\w*)$/);
-  }
+  // Escape special regex characters in the trigger
+  const escapedTrigger = triggerSetting.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const triggerRegex = new RegExp(`${escapedTrigger}(\\w*)$`);
+  triggerMatch = textBeforeCursor.match(triggerRegex);
   
   if (triggerMatch) {
     mentionQuery = triggerMatch[1] || '';
     mentionStartPos = cursorPos - triggerMatch[0].length;
+    
+    // Save the trigger offset in the full text (more reliable than Range for rich editors)
+    mentionTriggerOffset = mentionStartPos;
+    mentionFullTextAtTrigger = text;
+    
+    // Capture the current Range for later use during insertion
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0) {
+      mentionRange = sel.getRangeAt(0).cloneRange();
+    }
     
     if (!mentionPopover) {
       createMentionPopover(target);
@@ -2008,6 +2408,18 @@ function handleInputForMention(e) {
 
 // Listen for input events to detect @
 document.addEventListener('input', handleInputForMention, true);
+
+// Listen for input events to sync chips when text is edited/deleted
+document.addEventListener('input', (e) => {
+  const target = e.target;
+  if (target && (target.isContentEditable || target.tagName === 'TEXTAREA' || target.tagName === 'INPUT')) {
+    // Debounce the sync to avoid too frequent updates
+    clearTimeout(target._chipSyncTimeout);
+    target._chipSyncTimeout = setTimeout(() => {
+      syncChipsWithText(target);
+    }, 300);
+  }
+}, true);
 
 // For Claude/ProseMirror: also listen to keyup as input events may not fire reliably
 // This provides a backup detection method
@@ -2078,6 +2490,38 @@ document.addEventListener('click', (e) => {
 
 let isExpandingChips = false; // Prevent recursive expansion
 
+// Find send button with shadow DOM awareness for Copilot
+function findSendButtonDeep() {
+  const site = detectSite();
+  
+  if (site === 'copilot') {
+    // Stable testid when available
+    let btn = querySelectorDeep('[data-testid*="composer-send-button"]');
+    if (btn) return btn;
+    
+    // ARIA-role buttons with localized labels (i18n-safe)
+    const candidates = querySelectorAllDeep('button, [role="button"]');
+    const found = candidates.find(b => {
+      const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+      const testid = (b.getAttribute('data-testid') || '').toLowerCase();
+      return testid.includes('send') || aria.includes('send');
+    });
+    if (found) return found;
+    
+    return querySelectorDeep('button[type="submit"], button');
+  }
+  
+  // Standard DOM query for other sites
+  const cfg = getSiteConfig(site);
+  if (cfg?.sendButtonSelectors) {
+    for (const sel of cfg.sendButtonSelectors) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+  }
+  return null;
+}
+
 function setupSubmitInterceptor() {
   const site = detectSite();
   console.debug('[WebAiBridge] Setting up submit interceptor for site:', site);
@@ -2088,7 +2532,7 @@ function setupSubmitInterceptor() {
     // Skip if we're in the middle of expanding
     if (isExpandingChips) return;
     
-    if (e.key === 'Enter' && !e.shiftKey && !mentionPopover) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !mentionPopover) {
       const input = findChatInput();
       if (input && hasInlineChips(input)) {
         console.debug('[WebAiBridge] Enter pressed with chips, expanding...');
@@ -2107,8 +2551,9 @@ function setupSubmitInterceptor() {
     }
   }, true);
   
-  // Also intercept click on send buttons
-  document.addEventListener('mousedown', (e) => {
+  // Also intercept click/pointer on send buttons using capture phase
+  // Use pointerdown for better capture before click handlers
+  const handleSendClick = (e) => {
     if (isExpandingChips) return;
     
     const target = e.target;
@@ -2145,7 +2590,11 @@ function setupSubmitInterceptor() {
         // Let the click continue with expanded content
       }
     }
-  }, true);
+  };
+  
+  // Use both pointerdown (for Copilot) and mousedown (fallback) in capture phase
+  document.addEventListener('pointerdown', handleSendClick, { capture: true, passive: true });
+  document.addEventListener('mousedown', handleSendClick, { capture: true, passive: true });
   
   // Watch for form submissions
   document.addEventListener('submit', (e) => {
@@ -2161,6 +2610,28 @@ function setupSubmitInterceptor() {
       }, 200);
     }
   }, true);
+  
+  // For Copilot: also observe DOM for remounts and re-hook
+  if (site === 'copilot') {
+    const remountObserver = new MutationObserver(() => {
+      // Copilot SPA remounts the composer, ensure our hooks still work
+      // The event listeners on document persist, but we may need to re-find elements
+    });
+    remountObserver.observe(document.documentElement, { childList: true, subtree: true });
+    
+    // Handle SPA route changes
+    window.addEventListener('popstate', () => {
+      console.debug('[WebAiBridge] Route change detected, re-initializing...');
+    });
+    
+    if ('navigation' in window) {
+      try {
+        window.navigation.addEventListener('navigate', () => {
+          console.debug('[WebAiBridge] Navigation detected, re-initializing...');
+        });
+      } catch (e) {}
+    }
+  }
 }
 
 /**
