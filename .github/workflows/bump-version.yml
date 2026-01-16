@@ -1,0 +1,263 @@
+name: Create bump version PR
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version bump type.
+        required: true
+        type: choice
+        options:
+          - prerelease
+          - prepatch
+          - preminor
+          - premajor
+          - patch
+          - minor
+          - major
+      preid:
+        description: Prerelease identifier (e.g., 'alpha', 'beta', 'rc'). Only used with prerelease version types.
+        required: false
+        type: string
+        default: 'pre'
+jobs:
+  bump-version-pr:
+    name: Bump version PR
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: master
+      - name: Setup node env 
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'package.json'
+          check-latest: true
+          cache: 'npm'
+      - name: Create bump script
+        run: |
+          cat > bump-version.mjs << 'EOF'
+          import { execSync } from 'child_process';
+          import * as fs from 'fs';
+          import * as path from 'path';
+
+          const versionType = process.argv[2];
+          const preid = process.argv[3];
+          const changelogPath = 'CHANGELOG.md';
+
+          if (!versionType) {
+            console.error('Missing version type');
+            process.exit(1);
+          }
+
+          const pkgs = ['webaibridge-vscode', 'web-extension'];
+
+          let newVersion = '';
+
+          // Build npm version command suffix (we'll run per-package with --git-tag-version false)
+          const preFlag = (preid && preid.trim() !== '') ? ` --preid=${preid}` : '';
+
+          for (const pkg of pkgs) {
+            console.log(`Bumping version for package: ${pkg}`);
+            try {
+              execSync(`npm --prefix ${pkg} version --commit-hooks false --git-tag-version false ${versionType}${preFlag}`, { stdio: 'inherit' });
+            } catch (err) {
+              console.error(`npm version failed for ${pkg}:`, err.message);
+              process.exit(1);
+            }
+          }
+
+          // Read version from primary package (webaibridge-vscode)
+          try {
+            const vscodePkg = JSON.parse(fs.readFileSync(path.join('webaibridge-vscode', 'package.json'), 'utf8'));
+            newVersion = vscodePkg.version;
+            console.log('New version (from webaibridge-vscode):', newVersion);
+          } catch (err) {
+            console.error('Failed to read webaibridge-vscode/package.json', err);
+            process.exit(1);
+          }
+
+          // Ensure web-extension/package.json has the same version (in case npm handled differently)
+          try {
+            const webExtPkgPath = path.join('web-extension', 'package.json');
+            const webExtPkg = JSON.parse(fs.readFileSync(webExtPkgPath, 'utf8'));
+            if (webExtPkg.version !== newVersion) {
+              console.log(`Syncing web-extension version from ${webExtPkg.version} to ${newVersion}`);
+              webExtPkg.version = newVersion;
+              fs.writeFileSync(webExtPkgPath, JSON.stringify(webExtPkg, null, 2) + '\n', 'utf8');
+              execSync(`git add ${webExtPkgPath}`);
+            }
+          } catch (err) {
+            console.error('Failed to sync web-extension/package.json', err.message);
+          }
+
+          // Update extension manifest version (web-extension/manifest.json) if present
+          try {
+            const manifestPath = path.join('web-extension', 'manifest.json');
+            if (fs.existsSync(manifestPath)) {
+              const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+              console.log(`Updating manifest version from ${manifest.version} to ${newVersion}`);
+              manifest.version = newVersion;
+              fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+              execSync(`git add ${manifestPath}`);
+            }
+          } catch (err) {
+            console.error('Failed to update manifest.json', err.message);
+          }
+
+          // Update package-locks if present (npm version may already update them)
+          for (const pkg of pkgs) {
+            const lockPath = path.join(pkg, 'package-lock.json');
+            if (fs.existsSync(lockPath)) {
+              try {
+                const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+                if (lock.version !== newVersion) {
+                  lock.version = newVersion;
+                  fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n', 'utf8');
+                  execSync(`git add ${lockPath}`);
+                }
+              } catch (err) {
+                console.log(`Could not update lockfile for ${pkg}:`, err.message);
+              }
+            }
+          }
+
+          // Update CHANGELOG.md in same manner as example: replace '## master' with new version and inject missing PRs
+          if (!fs.existsSync(changelogPath)) {
+            console.log(`No changelog found at ${changelogPath}, skipping changelog update`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT || './output.txt', `version=${newVersion}\n`);
+            process.exit(0);
+          }
+
+          let changelog = fs.readFileSync(changelogPath, 'utf8');
+
+          // Get PRs since last tag
+          console.log('Fetching PRs since last tagged version...');
+          let latestTag = '';
+          try {
+            latestTag = execSync('git describe --tags --abbrev=0', { encoding: 'utf8' }).trim();
+            console.log('Latest tag:', latestTag);
+          } catch (e) {
+            console.log('No previous tags found, using all commits');
+            latestTag = '';
+          }
+
+          const commitRange = latestTag ? `${latestTag}..HEAD` : 'HEAD';
+          let commits = '';
+          try {
+            commits = execSync(`git log ${commitRange} --oneline`, { encoding: 'utf8' });
+          } catch (e) {
+            console.log('No commits found');
+            commits = '';
+          }
+
+          const prNumbers = [];
+          const prRegex = /#(\d+)/g;
+          let match;
+          while ((match = prRegex.exec(commits)) !== null) {
+            prNumbers.push(match[1]);
+          }
+
+          console.log(`Found ${prNumbers.length} PRs since last tag`);
+
+          const missingPrNumbers = prNumbers.filter(prNum => !changelog.includes(`#${prNum}`));
+          const missingEntries = [];
+
+          if (missingPrNumbers.length > 0) {
+            console.log(`Found ${missingPrNumbers.length} missing PRs, fetching details...`);
+
+            // Determine repo full name
+            let repoFullName = null;
+            try {
+              const remoteUrl = execSync('git config --get remote.origin.url', { encoding: 'utf8' }).trim();
+              const repoMatch = remoteUrl.match(/github\.com[:/](.+?)(?:\.git)?$/);
+              repoFullName = repoMatch ? repoMatch[1] : null;
+            } catch (e) {
+              console.log('Could not determine repository name');
+            }
+
+            for (const prNumber of missingPrNumbers) {
+              try {
+                const prJson = execSync(`gh pr view ${prNumber} --json title,author,number`, { encoding: 'utf8' });
+                const pr = JSON.parse(prJson);
+                if (pr.author.login.includes('dependabot')) {
+                  console.log(`Skipping dependabot PR #${prNumber}`);
+                  continue;
+                }
+                const prUrl = repoFullName ? `https://github.com/${repoFullName}/pull/${pr.number}` : `#${pr.number}`;
+                const entry = `- ${pr.title} ([#${pr.number}](${prUrl})) (by [${pr.author.login}](https://github.com/${pr.author.login}))`;
+                missingEntries.push(entry);
+                console.log('Added changelog entry for PR', prNumber);
+              } catch (e) {
+                console.log(`Could not fetch details for PR #${prNumber}: ${e.message}`);
+              }
+            }
+          }
+
+          // Update changelog structure: replace '## master' with new version
+          changelog = changelog.replace('## master', `## ${newVersion}`);
+          changelog = changelog.replaceAll('- _...Add new stuff here..._\n', '');
+
+          const masterSection = [
+            '## master',
+            '### ✨ Features and improvements',
+            '- _...Add new stuff here..._',
+            '',
+            '### 🐞 Bug fixes',
+            '- _...Add new stuff here..._',
+            '',
+            ''
+          ].join('\n');
+
+          const titleMatch = changelog.match(/^(# .+?\n\n)/);
+          let title = '';
+          let rest = changelog;
+          if (titleMatch) {
+            title = titleMatch[1];
+            rest = changelog.slice(title.length);
+          }
+
+          if (missingEntries.length > 0) {
+            console.log(`Adding ${missingEntries.length} missing PR entries to changelog`);
+            // Try to insert under Bug fixes for the new version
+            const bugFixesPattern = /^(## [^\n]+\n### ✨ Features and improvements\n*### 🐞 Bug fixes\n)/m;
+            const bugFixesMatch = rest.match(bugFixesPattern);
+            if (bugFixesMatch) {
+              const insertPoint = bugFixesMatch.index + bugFixesMatch[1].length;
+              const entriesText = '\n' + missingEntries.join('\n') + '\n';
+              rest = rest.slice(0, insertPoint) + entriesText + rest.slice(insertPoint);
+            } else {
+              rest = rest + '\n' + missingEntries.join('\n') + '\n';
+            }
+          }
+
+          changelog = title + masterSection + rest;
+          fs.writeFileSync(changelogPath, changelog, 'utf8');
+          execSync(`git add ${changelogPath}`);
+
+          // Commit changes
+          execSync(`git commit -m "chore(release): bump to ${newVersion}" || true`);
+
+          // Output version for workflow
+          if (process.env.GITHUB_OUTPUT) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${newVersion}\n`);
+          } else {
+            fs.appendFileSync('./output.txt', `version=${newVersion}\n`);
+          }
+          EOF
+      - name: Bump version and update changelog
+        id: version-details
+        run: |
+          node bump-version.mjs "${{ inputs.version }}" "${{ inputs.preid }}"
+          rm bump-version.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          commit-message: Release v${{ steps.version-details.outputs.version }}
+          branch: release-v${{ steps.version-details.outputs.version }}
+          title: Release v${{ steps.version-details.outputs.version }}
