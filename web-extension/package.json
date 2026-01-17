@@ -1,6 +1,6 @@
 {
   "name": "webaibridge-chrome",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "license": "BSD-2-Clause",
   "description": "Chrome extension for WebAiBridge",
   "scripts": {
