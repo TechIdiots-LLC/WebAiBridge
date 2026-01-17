@@ -8,10 +8,10 @@ function querySelectorAllDeep(selector, root = document) {
   const visit = (node) => {
     if (!node) return;
     if (node.querySelectorAll) {
-      node.querySelectorAll(selector).forEach((el) => out.push(el));
+      node.querySelectorAll(selector).forEach(el => out.push(el));
     }
     // Also check shadow roots
-    const elements = node.querySelectorAll ? node.querySelectorAll("*") : [];
+    const elements = node.querySelectorAll ? node.querySelectorAll('*') : [];
     for (const el of elements) {
       if (el.shadowRoot) visit(el.shadowRoot);
     }
@@ -30,15 +30,15 @@ function querySelectorDeep(selector, root = document) {
 function insertTextIntoCE(target, text) {
   if (!target) return false;
   target.focus();
-
+  
   // Try modern beforeinput path first
   try {
-    const ev = new InputEvent("beforeinput", {
-      inputType: "insertText",
+    const ev = new InputEvent('beforeinput', {
+      inputType: 'insertText',
       data: text,
       bubbles: true,
       cancelable: true,
-      composed: true,
+      composed: true
     });
     const accepted = target.dispatchEvent(ev);
     if (!accepted) {
@@ -46,9 +46,9 @@ function insertTextIntoCE(target, text) {
       return true;
     }
   } catch (e) {
-    console.debug("[WebAiBridge] beforeinput not supported:", e);
+    console.debug('[WebAiBridge] beforeinput not supported:', e);
   }
-
+  
   // Range insertion fallback
   const sel = window.getSelection();
   if (sel && sel.rangeCount > 0) {
@@ -60,7 +60,7 @@ function insertTextIntoCE(target, text) {
     range.collapse(true);
     sel.removeAllRanges();
     sel.addRange(range);
-    target.dispatchEvent(new Event("input", { bubbles: true }));
+    target.dispatchEvent(new Event('input', { bubbles: true }));
     return true;
   }
   return false;
@@ -71,98 +71,162 @@ function insertTextModern(target, text) {
     target = document.activeElement || findChatInput();
   }
   if (!target) return false;
-
+  
   if (target.isContentEditable) {
     return insertTextIntoCE(target, text);
   }
-
-  if ("value" in target) {
+  
+  if ('value' in target) {
     const start = target.selectionStart ?? target.value.length;
     const end = target.selectionEnd ?? target.value.length;
     const v = target.value;
     target.value = v.slice(0, start) + text + v.slice(end);
     const pos = start + text.length;
-    try {
-      target.setSelectionRange(pos, pos);
-    } catch (e) {}
-    target.dispatchEvent(new Event("input", { bubbles: true }));
+    try { target.setSelectionRange(pos, pos); } catch (e) {}
+    target.dispatchEvent(new Event('input', { bubbles: true }));
     return true;
   }
-
   return false;
 }
 
-// Find the active chat input element across sites (deep search + config)
+// Track the last focused input field before overlay appears
+let lastFocusedInput = null;
+
+// @ mention popover state
+let mentionPopover = null;
+let mentionQuery = '';
+let mentionStartPos = -1;
+let mentionRange = null; // Store the actual Range where trigger was typed
+let mentionTriggerOffset = -1; // Offset of the trigger character in the full text
+let mentionFullTextAtTrigger = ''; // Snapshot of full text when trigger was detected
+let selectedMentionIndex = 0;
+
+// Inserted context tracking (for chip bar display)
+let insertedContexts = [];
+let contextChipBar = null;
+
+// File picker state
+let isFilePickerMode = false;
+let workspaceFiles = []; // populated via REQUEST_FILE_LIST
+
+// Available @ mention options
+const mentionOptions = [
+  { id: 'focused-file', icon: '📄', label: 'Focused File', description: 'Currently open file in VS Code', tokens: null },
+  { id: 'selection', icon: '✂️', label: 'Selected Text', description: 'Current selection in VS Code', tokens: null },
+  { id: 'visible-editors', icon: '📑', label: 'Visible Editors', description: 'All visible editor contents', tokens: null },
+  { id: 'open-tabs', icon: '📂', label: 'All Open Tabs', description: 'Content from all open files', tokens: null },
+  { id: 'problems', icon: '⚠️', label: 'Problems', description: 'Errors and warnings from VS Code', tokens: null },
+  { id: 'file-tree', icon: '🌲', label: 'File Tree', description: 'Workspace folder structure', tokens: null },
+  { id: 'git-diff', icon: '📝', label: 'Git Changes', description: 'Uncommitted changes', tokens: null },
+  { id: 'terminal', icon: '💻', label: 'Terminal Output', description: 'Recent terminal output', tokens: null },
+  { id: 'file-search', icon: '🔍', label: 'Search Files...', description: 'Search for a specific file in workspace', tokens: null },
+];
+
+// Detect which AI chat site we're on
+const SITE_CONFIG = {
+  chatgpt: {
+    hostPatterns: ['chat.openai.com', 'chatgpt.com'],
+    inputSelectors: ['#prompt-textarea', 'textarea[data-id="root"]', 'div[contenteditable="true"][id*="prompt"]', 'textarea'],
+    sendButtonSelectors: ['button[data-testid="send-button"]', 'button[data-testid*="send"]']
+  },
+  gemini: {
+    hostPatterns: ['gemini.google.com'],
+    inputSelectors: ['.ql-editor[contenteditable="true"]', 'rich-textarea .ql-editor', 'div[contenteditable="true"][aria-label*="Enter"]', 'div[contenteditable="true"]'],
+    sendButtonSelectors: ['button[aria-label*="Send"]']
+  },
+  claude: {
+    hostPatterns: ['claude.ai'],
+    inputSelectors: ['div[contenteditable="true"].ProseMirror', 'div[contenteditable="true"]'],
+    sendButtonSelectors: ['button[aria-label*="Send"]']
+  },
+  aistudio: {
+    hostPatterns: ['aistudio.google.com'],
+    inputSelectors: ['textarea[aria-label*="prompt"]', 'textarea'],
+    sendButtonSelectors: ['button[aria-label*="Send"]']
+  },
+  copilot: {
+    hostPatterns: ['m365.cloud.microsoft.com', 'copilot.microsoft.com'],
+    inputSelectors: ['textarea[placeholder*="Message"]', 'div[contenteditable="true"][data-placeholder]', 'textarea', 'div[contenteditable="true"]'],
+    sendButtonSelectors: ['button[aria-label*="Send"]', 'button[data-testid*="send"]']
+  }
+};
+
+function detectSite() {
+  const host = location.hostname;
+  for (const [key, cfg] of Object.entries(SITE_CONFIG)) {
+    if (cfg.hostPatterns.some(p => host.includes(p))) return key;
+  }
+  return 'unknown';
+}
+
+function getSiteConfig(siteKey) {
+  return SITE_CONFIG[siteKey] || null;
+}
+
+// Find the chat input field for each site
 function findChatInput() {
-  if (lastFocusedInput) return lastFocusedInput;
-
-  const active = document.activeElement;
-  if (
-    active &&
-    (active.isContentEditable ||
-      active.tagName === "TEXTAREA" ||
-      active.tagName === "INPUT")
-  )
-    return active;
-
-  // Try configured selectors (deep search first)
-  const selectors =
-    typeof cfg !== "undefined" && cfg && Array.isArray(cfg.inputSelectors)
-      ? cfg.inputSelectors
-      : [];
-  for (const selector of selectors) {
-    try {
-      const el =
-        querySelectorDeep(selector) || document.querySelector(selector);
-      if (el) return el;
-    } catch (e) {}
+  const site = detectSite();
+  const cfg = getSiteConfig(site);
+  
+  // For Copilot, use shadow DOM aware deep queries with ARIA-first approach
+  if (site === 'copilot') {
+    // Prefer ARIA role="textbox" + contenteditable (works across languages)
+    const ce = querySelectorDeep('[role="textbox"][contenteditable="true"][aria-multiline="true"]');
+    if (ce) return ce;
+    
+    // Try known selectors with deep query
+    for (const selector of (cfg?.inputSelectors || [])) {
+      try {
+        const el = querySelectorDeep(selector);
+        if (el) return el;
+      } catch (e) {}
+    }
+    
+    // Fallbacks for Copilot variants
+    return querySelectorDeep('div[contenteditable="true"][data-placeholder]') ||
+           querySelectorDeep('div[contenteditable="true"][aria-label]') ||
+           querySelectorDeep('textarea[aria-label]') ||
+           querySelectorDeep('div[contenteditable="true"]') ||
+           querySelectorDeep('textarea');
+  }
+  
+  if (!cfg) {
+    // Generic fallback
+    return document.querySelector('textarea') || document.querySelector('div[contenteditable="true"]') || document.querySelector('input[type="text"]');
   }
 
-  // Common deep fallbacks
-  return (
-    querySelectorDeep('div[contenteditable="true"][data-placeholder]') ||
-    querySelectorDeep('div[contenteditable="true"][aria-label]') ||
-    querySelectorDeep("textarea[aria-label]") ||
-    querySelectorDeep('div[contenteditable="true"]') ||
-    querySelectorDeep("textarea") ||
-    document.querySelector('input[type="text"]') ||
-    null
-  );
+  for (const selector of cfg.inputSelectors) {
+    try {
+      const el = document.querySelector(selector);
+      if (el) return el;
+    } catch (e) {
+      // ignore invalid selector
+    }
+  }
+
+  // Last resort fallback
+  return document.querySelector('textarea') || document.querySelector('div[contenteditable="true"]') || document.querySelector('input[type="text"]');
 }
 
 // Track focus on input fields
-document.addEventListener(
-  "focusin",
-  (e) => {
-    const el = e.target;
-    if (
-      el &&
-      (el.tagName === "TEXTAREA" ||
-        el.tagName === "INPUT" ||
-        el.isContentEditable)
-    ) {
-      lastFocusedInput = el;
-    }
-  },
-  true,
-);
+document.addEventListener('focusin', (e) => {
+  const el = e.target;
+  if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable)) {
+    lastFocusedInput = el;
+  }
+}, true);
 
 // Use shared tokenizer from tokenizer.js (loaded before content.js in manifest)
 const Tokenizer = window.WebAiBridgeTokenizer || {
   // Fallback if tokenizer not loaded
-  estimateTokens: (text) => (text ? Math.ceil(text.length / 4) : 0),
+  estimateTokens: (text) => text ? Math.ceil(text.length / 4) : 0,
   getLimit: () => 8192,
   isWarningLevel: (tokens) => tokens > 6500,
   exceedsLimit: (tokens) => tokens > 8192,
-  getTokenInfo: (text) => ({
-    tokens: Math.ceil((text || "").length / 4),
-    status: "ok",
-  }),
+  getTokenInfo: (text) => ({ tokens: Math.ceil((text || '').length / 4), status: 'ok' }),
   formatTokenCount: (n) => n.toString(),
   truncateToLimit: (text, model, reserve) => text.substring(0, 30000),
-  chunkText: (text, maxTokens) => [
-    { text, tokens: Math.ceil(text.length / 4), partNumber: 1, totalParts: 1 },
-  ],
+  chunkText: (text, maxTokens) => [{ text, tokens: Math.ceil(text.length / 4), partNumber: 1, totalParts: 1 }]
 };
 
 /**
@@ -172,17 +236,17 @@ const Tokenizer = window.WebAiBridgeTokenizer || {
 function estimateTokens(text) {
   const site = detectSite();
   let tokens = Tokenizer.estimateTokens(text);
-
+  
   // Gemini's SentencePiece tokenizer is ~15-20% more efficient for code
   // This means we can be less aggressive with warnings
-  if (site === "gemini" || site === "aistudio") {
+  if (site === 'gemini' || site === 'aistudio') {
     tokens = Math.floor(tokens * 0.85);
   }
-
+  
   return tokens;
 }
 
-function getLimit(model = "default") {
+function getLimit(model = 'default') {
   return Tokenizer.getLimit(model);
 }
 
@@ -190,20 +254,20 @@ function getLimit(model = "default") {
  * Check if tokens are at warning level
  * Gemini has massive context windows so we relax the warning threshold
  */
-function isWarningLevel(tokens, model = "default") {
+function isWarningLevel(tokens, model = 'default') {
   const site = detectSite();
-
+  
   // Gemini Pro/1.5 Pro can handle 1M+ tokens - be less aggressive with warnings
-  if (site === "gemini" || site === "aistudio") {
+  if (site === 'gemini' || site === 'aistudio') {
     const limit = Tokenizer.getLimit(model);
     // Only warn at 90% for Gemini instead of 80%
     return tokens > limit * 0.9;
   }
-
+  
   return Tokenizer.isWarningLevel(tokens, model);
 }
 
-function exceedsLimit(tokens, model = "default") {
+function exceedsLimit(tokens, model = 'default') {
   return Tokenizer.exceedsLimit(tokens, model);
 }
 
@@ -219,67 +283,61 @@ let currentChunkIndex = 0;
  */
 async function applyLimitMode(text) {
   return new Promise((resolve) => {
-    chrome.storage.local.get(
-      ["messageLimit", "limitMode", "currentModel"],
-      (res) => {
-        const customLimit = res?.messageLimit || 0;
-        const mode = res?.limitMode || "warn";
-        const model = res?.currentModel || "gpt-4";
-
-        const modelLimit = Tokenizer.getLimit(model);
-        const effectiveLimit =
-          customLimit > 0 ? Math.min(customLimit, modelLimit) : modelLimit;
-        const tokens = estimateTokens(text);
-
-        console.debug(
-          `Limit check: ${tokens} tokens, limit: ${effectiveLimit}, mode: ${mode}`,
-        );
-
-        if (tokens <= effectiveLimit) {
-          // Under limit, just insert
-          resolve({ action: "insert", text, tokens, limit: effectiveLimit });
-          return;
-        }
-
-        // Over limit - apply mode
-        switch (mode) {
-          case "truncate":
-            // Truncate to fit
-            const truncated = Tokenizer.truncateToLimit(text, model, 100);
-            resolve({
-              action: "insert",
-              text: truncated,
-              tokens: estimateTokens(truncated),
-              limit: effectiveLimit,
-              wasTruncated: true,
-              originalTokens: tokens,
-            });
-            break;
-
-          case "chunk":
-            // Split into chunks
-            const chunks = Tokenizer.chunkText(text, effectiveLimit);
-            resolve({
-              action: "chunk",
-              chunks,
-              tokens,
-              limit: effectiveLimit,
-            });
-            break;
-
-          case "warn":
-          default:
-            // Warn user but allow insertion
-            resolve({
-              action: "warn",
-              text,
-              tokens,
-              limit: effectiveLimit,
-            });
-            break;
-        }
-      },
-    );
+    chrome.storage.local.get(['messageLimit', 'limitMode', 'currentModel'], (res) => {
+      const customLimit = res?.messageLimit || 0;
+      const mode = res?.limitMode || 'warn';
+      const model = res?.currentModel || 'gpt-4';
+      
+      const modelLimit = Tokenizer.getLimit(model);
+      const effectiveLimit = customLimit > 0 ? Math.min(customLimit, modelLimit) : modelLimit;
+      const tokens = estimateTokens(text);
+      
+      console.debug(`Limit check: ${tokens} tokens, limit: ${effectiveLimit}, mode: ${mode}`);
+      
+      if (tokens <= effectiveLimit) {
+        // Under limit, just insert
+        resolve({ action: 'insert', text, tokens, limit: effectiveLimit });
+        return;
+      }
+      
+      // Over limit - apply mode
+      switch (mode) {
+        case 'truncate':
+          // Truncate to fit
+          const truncated = Tokenizer.truncateToLimit(text, model, 100);
+          resolve({ 
+            action: 'insert', 
+            text: truncated, 
+            tokens: estimateTokens(truncated), 
+            limit: effectiveLimit,
+            wasTruncated: true,
+            originalTokens: tokens
+          });
+          break;
+          
+        case 'chunk':
+          // Split into chunks
+          const chunks = Tokenizer.chunkText(text, effectiveLimit);
+          resolve({ 
+            action: 'chunk', 
+            chunks, 
+            tokens, 
+            limit: effectiveLimit 
+          });
+          break;
+          
+        case 'warn':
+        default:
+          // Warn user but allow insertion
+          resolve({ 
+            action: 'warn', 
+            text, 
+            tokens, 
+            limit: effectiveLimit 
+          });
+          break;
+      }
+    });
   });
 }
 
@@ -289,13 +347,13 @@ async function applyLimitMode(text) {
 function showChunkNavigator(chunks, inputElement) {
   pendingChunks = chunks;
   currentChunkIndex = 0;
-
+  
   // Remove existing navigator
-  const existing = document.getElementById("webaibridge-chunk-nav");
+  const existing = document.getElementById('webaibridge-chunk-nav');
   if (existing) existing.remove();
-
-  const nav = document.createElement("div");
-  nav.id = "webaibridge-chunk-nav";
+  
+  const nav = document.createElement('div');
+  nav.id = 'webaibridge-chunk-nav';
   nav.style.cssText = `
     position: fixed;
     bottom: 20px;
@@ -311,7 +369,7 @@ function showChunkNavigator(chunks, inputElement) {
     box-shadow: 0 4px 16px rgba(0,0,0,0.4);
     min-width: 280px;
   `;
-
+  
   function updateNavigator() {
     const chunk = pendingChunks[currentChunkIndex];
     nav.innerHTML = `
@@ -324,37 +382,37 @@ function showChunkNavigator(chunks, inputElement) {
         <span style="color:#666">(~${Tokenizer.formatTokenCount(chunk.tokens)} tokens)</span>
       </div>
       <div style="display:flex;gap:8px;margin-bottom:10px">
-        <button id="chunk-prev" style="flex:1;padding:8px;border:1px solid #3c3c3c;background:#2d2d2d;color:#d4d4d4;border-radius:4px;cursor:pointer" ${currentChunkIndex === 0 ? 'disabled style="opacity:0.5"' : ""}>← Previous</button>
+        <button id="chunk-prev" style="flex:1;padding:8px;border:1px solid #3c3c3c;background:#2d2d2d;color:#d4d4d4;border-radius:4px;cursor:pointer" ${currentChunkIndex === 0 ? 'disabled style="opacity:0.5"' : ''}>← Previous</button>
         <button id="chunk-insert" style="flex:1;padding:8px;border:none;background:#0e639c;color:#fff;border-radius:4px;cursor:pointer;font-weight:500">Insert Part ${chunk.partNumber}</button>
-        <button id="chunk-next" style="flex:1;padding:8px;border:1px solid #3c3c3c;background:#2d2d2d;color:#d4d4d4;border-radius:4px;cursor:pointer" ${currentChunkIndex === chunks.length - 1 ? 'disabled style="opacity:0.5"' : ""}>Next →</button>
+        <button id="chunk-next" style="flex:1;padding:8px;border:1px solid #3c3c3c;background:#2d2d2d;color:#d4d4d4;border-radius:4px;cursor:pointer" ${currentChunkIndex === chunks.length - 1 ? 'disabled style="opacity:0.5"' : ''}>Next →</button>
       </div>
       <div style="font-size:11px;color:#666">Insert each part and send before inserting the next</div>
     `;
-
+    
     // Attach event handlers
-    nav.querySelector("#chunk-close").onclick = () => {
+    nav.querySelector('#chunk-close').onclick = () => {
       nav.remove();
       pendingChunks = [];
     };
-
-    nav.querySelector("#chunk-prev").onclick = () => {
+    
+    nav.querySelector('#chunk-prev').onclick = () => {
       if (currentChunkIndex > 0) {
         currentChunkIndex--;
         updateNavigator();
       }
     };
-
-    nav.querySelector("#chunk-next").onclick = () => {
+    
+    nav.querySelector('#chunk-next').onclick = () => {
       if (currentChunkIndex < pendingChunks.length - 1) {
         currentChunkIndex++;
         updateNavigator();
       }
     };
-
-    nav.querySelector("#chunk-insert").onclick = () => {
+    
+    nav.querySelector('#chunk-insert').onclick = () => {
       const chunk = pendingChunks[currentChunkIndex];
       const partHeader = `[Part ${chunk.partNumber}/${chunk.totalParts}]\n\n`;
-
+      
       if (inputElement) {
         inputElement.focus();
         setTimeout(() => {
@@ -364,12 +422,9 @@ function showChunkNavigator(chunks, inputElement) {
             if (currentChunkIndex < pendingChunks.length - 1) {
               currentChunkIndex++;
               updateNavigator();
-              showNotification(
-                `Part ${chunk.partNumber} inserted. Send it, then insert Part ${chunk.partNumber + 1}.`,
-                "info",
-              );
+              showNotification(`Part ${chunk.partNumber} inserted. Send it, then insert Part ${chunk.partNumber + 1}.`, 'info');
             } else {
-              showNotification("All parts inserted!", "success");
+              showNotification('All parts inserted!', 'success');
               nav.remove();
               pendingChunks = [];
             }
@@ -378,7 +433,7 @@ function showChunkNavigator(chunks, inputElement) {
       }
     };
   }
-
+  
   document.body.appendChild(nav);
   updateNavigator();
 }
@@ -387,8 +442,8 @@ function showChunkNavigator(chunks, inputElement) {
  * Show limit warning dialog
  */
 function showLimitWarning(tokens, limit, onProceed, onCancel) {
-  const dialog = document.createElement("div");
-  dialog.id = "webaibridge-limit-warning";
+  const dialog = document.createElement('div');
+  dialog.id = 'webaibridge-limit-warning';
   dialog.style.cssText = `
     position: fixed;
     top: 50%;
@@ -404,9 +459,9 @@ function showLimitWarning(tokens, limit, onProceed, onCancel) {
     box-shadow: 0 4px 24px rgba(0,0,0,0.5);
     max-width: 400px;
   `;
-
+  
   const percentage = Math.round((tokens / limit) * 100);
-
+  
   dialog.innerHTML = `
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
       <span style="font-size:24px">⚠️</span>
@@ -421,15 +476,15 @@ function showLimitWarning(tokens, limit, onProceed, onCancel) {
       <button id="limit-proceed" style="flex:1;padding:10px;border:none;background:#f48771;color:#1e1e1e;border-radius:4px;cursor:pointer;font-weight:500">Insert Anyway</button>
     </div>
   `;
-
+  
   document.body.appendChild(dialog);
-
-  dialog.querySelector("#limit-cancel").onclick = () => {
+  
+  dialog.querySelector('#limit-cancel').onclick = () => {
     dialog.remove();
     if (onCancel) onCancel();
   };
-
-  dialog.querySelector("#limit-proceed").onclick = () => {
+  
+  dialog.querySelector('#limit-proceed').onclick = () => {
     dialog.remove();
     if (onProceed) onProceed();
   };
@@ -438,16 +493,16 @@ function showLimitWarning(tokens, limit, onProceed, onCancel) {
 /**
  * Show a notification toast
  */
-function showNotification(message, type = "info") {
+function showNotification(message, type = 'info') {
   const colors = {
-    info: { bg: "#1e3a5f", border: "#3c7fb6", color: "#9cdcfe" },
-    success: { bg: "#1e3a1e", border: "#3c8c3c", color: "#89d185" },
-    warning: { bg: "#5a4a1d", border: "#8b7a3a", color: "#dcdcaa" },
-    error: { bg: "#5a1d1d", border: "#8b3a3a", color: "#f48771" },
+    info: { bg: '#1e3a5f', border: '#3c7fb6', color: '#9cdcfe' },
+    success: { bg: '#1e3a1e', border: '#3c8c3c', color: '#89d185' },
+    warning: { bg: '#5a4a1d', border: '#8b7a3a', color: '#dcdcaa' },
+    error: { bg: '#5a1d1d', border: '#8b3a3a', color: '#f48771' }
   };
   const c = colors[type] || colors.info;
-
-  const notif = document.createElement("div");
+  
+  const notif = document.createElement('div');
   notif.style.cssText = `
     position: fixed;
     bottom: 20px;
@@ -466,10 +521,10 @@ function showNotification(message, type = "info") {
   `;
   notif.textContent = message;
   document.body.appendChild(notif);
-
+  
   setTimeout(() => {
-    notif.style.opacity = "0";
-    notif.style.transition = "opacity 0.3s";
+    notif.style.opacity = '0';
+    notif.style.transition = 'opacity 0.3s';
     setTimeout(() => notif.remove(), 300);
   }, 4000);
 }
@@ -487,9 +542,9 @@ let inlineChipStylesInjected = false;
 function injectInlineChipStyles() {
   if (inlineChipStylesInjected) return;
   inlineChipStylesInjected = true;
-
-  const style = document.createElement("style");
-  style.id = "webaibridge-inline-chip-styles";
+  
+  const style = document.createElement('style');
+  style.id = 'webaibridge-inline-chip-styles';
   style.textContent = `
     .webaibridge-inline-chip {
       display: inline-flex;
@@ -550,21 +605,114 @@ function injectInlineChipStyles() {
 }
 
 /**
+ * Create an inline chip element to insert into the input
+ */
+function createInlineChip(optionId, label, tokens, content, uniqueId) {
+  injectInlineChipStyles();
+  
+  const option = mentionOptions.find(o => o.id === optionId);
+  const icon = option?.icon || '📎';
+  
+  const chip = document.createElement('span');
+  chip.className = 'webaibridge-inline-chip';
+  chip.contentEditable = 'false';
+  chip.dataset.wabChipId = uniqueId;
+  chip.dataset.wabContent = 'true'; // Marker for finding chips
+  
+  chip.innerHTML = `
+    <span class="chip-icon">${icon}</span>
+    <span class="chip-label" title="${label}">${label}</span>
+    <span class="chip-tokens">${Tokenizer.formatTokenCount(tokens)}</span>
+    <button class="chip-remove" title="Remove">×</button>
+  `;
+  
+  // Handle remove button click
+  chip.querySelector('.chip-remove').addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    removeInlineChip(uniqueId);
+  });
+  
+  // Prevent cursor from entering the chip
+  chip.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  
+  return chip;
+}
+
+/**
+ * Insert an inline chip into the input field
+ * Inserts a readable placeholder that expands on submit
+ * 
+ * Placeholder formats:
+ * - @focused-file → @filename.ext (uses actual filename)
+ * - @selection → @selection-1, @selection-2, etc.
+ * - @visible-editors, @problems, etc. → @visible-editors-1, etc. (if multiple)
+ */
+
+// Counter for generating unique selection IDs
+let selectionCounter = 0;
+
+// Track used placeholders to handle duplicates
+let usedPlaceholders = {};
+
+// Placeholder formats:
+// Standard (Gemini, Claude, ChatGPT): Uses zero-width chars for invisibility
+// Copilot: Uses visible [[WAB::id::label]] format that survives sanitization
+const PLACEHOLDER_PREFIX = '\u200B\u200C'; // ZWSP + ZWNJ
+const PLACEHOLDER_SUFFIX = '\u200C\u200B'; // ZWNJ + ZWSP
+const WAB_TOK_PREFIX = '[[WAB::';
+const WAB_TOK_SUFFIX = ']]';
+
+function createSecurePlaceholder(label) {
+  const site = detectSite();
+  const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID().slice(0,8) : Date.now().toString(36);
+  // Sanitize label (remove spaces/brackets)
+  const safeLabel = String(label || '').replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0,40);
+  
+  // For Copilot, use visible [[WAB::id::label]] format that won't be stripped
+  if (site === 'copilot') {
+    return `${WAB_TOK_PREFIX}${id}::${safeLabel}${WAB_TOK_SUFFIX}`;
+  }
+  
+  // For other sites, use zero-width wrapper
+  return `${PLACEHOLDER_PREFIX}@${safeLabel}[${id}]${PLACEHOLDER_SUFFIX}`;
+}
+
+// Check if a placeholder matches our format (either standard or Copilot)
+function isValidPlaceholder(text) {
+  if (!text || typeof text !== 'string') return false;
+  // Standard format
+  if (text.startsWith(PLACEHOLDER_PREFIX) && text.endsWith(PLACEHOLDER_SUFFIX)) return true;
+  // Copilot format
+  if (text.startsWith(WAB_TOK_PREFIX) && text.endsWith(WAB_TOK_SUFFIX)) return true;
+  return false;
+}
+
 function insertInlineChip(optionId, label, tokens, inputElement, content, savedRange = null, savedQuery = '') {
   const uniqueId = `wab-${optionId}-${Date.now()}`;
   
-  // Generate placeholder label (same as before)
+  // Generate an appropriate placeholder label based on context type (without @ prefix)
   let placeholderLabel;
+  
+  // Check if label looks like a filename (has extension) rather than a generic label
   const looksLikeFilename = label && /\.[a-zA-Z0-9]+$/.test(label) && !label.startsWith('Focused');
   
   if (optionId === 'focused-file' && looksLikeFilename) {
-    const filename = label.includes('/') ? label.split('/').pop() :
-                      label.includes('\\') ? label.split('\\').pop() : label;
+    // Use the actual filename for focused files
+    // Extract just the filename from path if needed
+    const filename = label.includes('/') ? label.split('/').pop() : 
+                     label.includes('\\') ? label.split('\\').pop() : label;
     placeholderLabel = filename;
   } else if (optionId === 'selection') {
+    // Selections get incrementing IDs
     selectionCounter++;
     placeholderLabel = `selection-${selectionCounter}`;
   } else {
+    // For other types, use the option ID
+    // If we already have one with this ID, add a number
     const baseId = optionId;
     if (usedPlaceholders[baseId]) {
       usedPlaceholders[baseId]++;
@@ -575,7 +723,7 @@ function insertInlineChip(optionId, label, tokens, inputElement, content, savedR
     }
   }
   
-  // Handle duplicates
+  // Handle duplicate placeholders (e.g., same file added twice)
   let finalLabel = placeholderLabel;
   let dupCounter = 1;
   let testPlaceholder = createSecurePlaceholder(finalLabel);
@@ -587,25 +735,31 @@ function insertInlineChip(optionId, label, tokens, inputElement, content, savedR
   placeholderLabel = finalLabel;
   
   console.debug('[WebAiBridge] insertInlineChip called:', {
-    optionId, label, tokens, contentLength: content?.length, 
-    placeholderLabel, uniqueId, hasSavedRange: !!savedRange, savedQuery
+    optionId,
+    label,
+    tokens,
+    contentLength: content?.length,
+    placeholderLabel,
+    uniqueId,
+    hasSavedRange: !!savedRange,
+    savedQuery
   });
   
-  // Create placeholder
+  // Create a secure, hard-to-accidentally-type placeholder token
   const wrappedPlaceholder = createSecurePlaceholder(placeholderLabel);
-  
-  // Store content
+
+  // Store content for later expansion (keyed by wrapped placeholder for easy lookup)
   contextContents[wrappedPlaceholder] = content;
-  console.debug('[WebAiBridge] Stored content for placeholder:', placeholderLabel, 
-                'contextContents now has', Object.keys(contextContents).length, 'entries');
+  console.debug('[WebAiBridge] Stored content for placeholder:', placeholderLabel, 'contextContents now has', Object.keys(contextContents).length, 'entries');
   
-  // Track the chip
+  // Track the chip - use placeholderLabel (the actual filename) for display when available
   const option = mentionOptions.find(o => o.id === optionId);
-  const displayLabel = (optionId === 'focused-file' && placeholderLabel && placeholderLabel !== 'focused-file')
-     ? placeholderLabel
-     : (label || option?.label || optionId);
+  const displayLabel = (optionId === 'focused-file' && placeholderLabel && placeholderLabel !== 'focused-file') 
+    ? placeholderLabel 
+    : (label || option?.label || optionId);
   insertedContexts.push({
     id: uniqueId,
+    // store the wrapped placeholder as the token actually present in the input
     placeholder: wrappedPlaceholder,
     typeId: optionId,
     label: displayLabel,
@@ -617,203 +771,89 @@ function insertInlineChip(optionId, label, tokens, inputElement, content, savedR
   });
   console.debug('[WebAiBridge] insertedContexts now has', insertedContexts.length, 'entries');
   
-  // NOW THE KEY FIX: Insert the placeholder
-  const site = detectSite();
-  const triggerSetting = cachedTriggerChar || '@';
-  
+  // Insert the placeholder text, replacing the trigger
   if (inputElement.isContentEditable) {
     let inserted = false;
+    const site = detectSite();
     
-    // Focus first
+    // Focus the input first to ensure we can manipulate it
     inputElement.focus();
     
-    // Get current text
+    // Get the current text and find the trigger based on setting
     const currentText = inputElement.innerText || inputElement.textContent || '';
+    const triggerSetting = cachedTriggerChar || '@';
     
-    // CRITICAL FIX FOR COPILOT: Use a different insertion strategy
+    // Build trigger pattern - the trigger followed by optional query
+    const triggerWithQuery = savedQuery ? `${triggerSetting}${savedQuery}` : triggerSetting;
+    
+    // For Copilot: use text replacement approach that doesn't rely on Range API
     if (site === 'copilot') {
       try {
-        // Strategy: Select all text, build new text with placeholder, then use modern input API
-        const triggerWithQuery = savedQuery ? `${triggerSetting}${savedQuery}` : triggerSetting;
-        
-        // Find the last occurrence of trigger+query
+        // Find the trigger in the text
         const triggerIdx = currentText.lastIndexOf(triggerWithQuery);
         
         if (triggerIdx >= 0) {
-          // Build the new text: before + placeholder + space + after
+          const triggerLen = triggerSetting.length + (savedQuery ? savedQuery.length : 0);
           const before = currentText.slice(0, triggerIdx);
-          const after = currentText.slice(triggerIdx + triggerWithQuery.length);
+          const after = currentText.slice(triggerIdx + triggerLen);
           const newText = before + wrappedPlaceholder + ' ' + after;
           
-          console.debug('[WebAiBridge] Copilot insertion:', {
-            triggerIdx,
-            triggerWithQuery,
-            beforeLen: before.length,
-            afterLen: after.length,
-            newTextLen: newText.length
-          });
-          
-          // Use the MODERN beforeinput API with full text replacement
-          // This works better with Copilot's React reconciliation
+          // Use Range to select all and replace with modern API
           const range = document.createRange();
           range.selectNodeContents(inputElement);
           const sel = window.getSelection();
           sel.removeAllRanges();
           sel.addRange(range);
           
-          // Dispatch beforeinput event FIRST (this is key for Copilot)
-          const beforeInputEvent = new InputEvent('beforeinput', {
-            inputType: 'insertText',
-            data: newText,
-            bubbles: true,
-            cancelable: true,
-            composed: true
-          });
+          // Use insertTextIntoCE for proper editor integration
+          insertTextIntoCE(inputElement, newText);
           
-          if (!inputElement.dispatchEvent(beforeInputEvent)) {
-            // Event was handled, just update the UI
-            console.debug('[WebAiBridge] beforeinput event was handled by editor');
-          }
-          
-          // Now set the text content (Copilot needs this)
-          // Use textContent instead of innerText for better compatibility
-          inputElement.textContent = newText;
-          
-          // Dispatch standard input event
-          inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-          inputElement.dispatchEvent(new Event('change', { bubbles: true }));
-          
-          // Position cursor after placeholder
+          // Try to position cursor at the right place
           setTimeout(() => {
             try {
-              const targetPos = triggerIdx + wrappedPlaceholder.length + 1;
-              
-              // Find the text node and position within it
-              const walker = document.createTreeWalker(
-                inputElement, 
-                NodeFilter.SHOW_TEXT, 
-                null, 
-                false
-              );
-              
-              let charCount = 0;
-              let node;
-              while (node = walker.nextNode()) {
-                const nodeLen = node.textContent.length;
-                if (charCount + nodeLen >= targetPos) {
-                  const offset = targetPos - charCount;
-                  const newRange = document.createRange();
-                  newRange.setStart(node, Math.min(offset, nodeLen));
-                  newRange.collapse(true);
-                  const newSel = window.getSelection();
-                  newSel.removeAllRanges();
-                  newSel.addRange(newRange);
-                  console.debug('[WebAiBridge] Cursor positioned at', targetPos);
-                  break;
+              const newSel = window.getSelection();
+              if (newSel.rangeCount > 0) {
+                const newRange = newSel.getRangeAt(0);
+                const targetPos = triggerIdx + wrappedPlaceholder.length + 1;
+                // Walk to find position
+                const walker = document.createTreeWalker(inputElement, NodeFilter.SHOW_TEXT, null, false);
+                let charCount = 0;
+                while (walker.nextNode()) {
+                  const node = walker.currentNode;
+                  const nodeLen = (node.textContent || '').length;
+                  if (charCount + nodeLen >= targetPos) {
+                    newRange.setStart(node, Math.min(targetPos - charCount, nodeLen));
+                    newRange.collapse(true);
+                    newSel.removeAllRanges();
+                    newSel.addRange(newRange);
+                    break;
+                  }
+                  charCount += nodeLen;
                 }
-                charCount += nodeLen;
               }
-              
-              // Final input event after cursor positioning
-              inputElement.dispatchEvent(new Event('input', { bubbles: true }));
             } catch (e) {
               console.debug('[WebAiBridge] Cursor positioning failed', e);
             }
-          }, 50); // Slightly longer delay for Copilot
+          }, 10);
           
           inserted = true;
-          console.debug('[WebAiBridge] Copilot insertion successful');
+          console.debug('[WebAiBridge] Inserted placeholder via Copilot text replacement');
         }
       } catch (e) {
-        console.error('[WebAiBridge] Copilot insertion failed:', e);
+        console.debug('[WebAiBridge] Copilot text replacement failed', e);
       }
     }
     
-    // For other sites, use the existing TreeWalker approach
-    if (!inserted && site !== 'copilot') {
+    // Strategy: Walk the DOM to find the trigger character, then use Range API
+    if (!inserted) {
       const triggerLength = triggerSetting.length + (savedQuery ? savedQuery.length : 0);
       
       try {
+        // Walk through text nodes to find the trigger
         const walker = document.createTreeWalker(inputElement, NodeFilter.SHOW_TEXT, null, false);
         let foundNode = null;
         let foundOffset = -1;
         
-        const escapedTrigger = triggerSetting.replace(/[.*+?^${}()|[\\]\\]/g, '\\\$&');
-        
-        while (walker.nextNode()) {
-          const node = walker.currentNode;
-          const text = node.textContent || '';
-          
-          const triggerPattern = savedQuery ?
-            new RegExp(`${escapedTrigger}${savedQuery.replace(/[.*+?^${}()|[\\]\\]/g, '\\\$&')}$`) :
-            new RegExp(`${escapedTrigger}$`);
-          
-          const match = text.match(triggerPattern);
-          if (match) {
-            foundNode = node;
-            foundOffset = match.index;
-            break;
-          }
-        }
-        
-        if (foundNode && foundOffset >= 0) {
-          const sel = window.getSelection();
-          const range = document.createRange();
-          
-          range.setStart(foundNode, foundOffset);
-          range.setEnd(foundNode, foundOffset + triggerLength);
-          range.deleteContents();
-          
-          const textNode = document.createTextNode(wrappedPlaceholder + ' ');
-          range.insertNode(textNode);
-          
-          range.setStartAfter(textNode);
-          range.collapse(true);
-          sel.removeAllRanges();
-          sel.addRange(range);
-          
-          inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-          inserted = true;
-          console.debug('[WebAiBridge] Inserted placeholder via TreeWalker + Range API');
-        }
-      } catch (e) {
-        console.debug('[WebAiBridge] TreeWalker + Range insertion failed', e);
-      }
-    }
-    
-    // Final fallback: just append
-    if (!inserted) {
-      insertIntoContentEditable(inputElement, wrappedPlaceholder + ' ');
-      inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-      console.debug('[WebAiBridge] Inserted placeholder via fallback append');
-    }
-  } else {
-    // For textarea/input (unchanged)
-    const val = inputElement.value || '';
-    const pos = inputElement.selectionStart || val.length;
-    const before = val.slice(0, pos);
-    
-    const triggerSetting = cachedTriggerChar || '@';
-    const atIdx = before.lastIndexOf(triggerSetting);
-    
-    if (atIdx >= 0) {
-      inputElement.value = before.slice(0, atIdx) + wrappedPlaceholder + ' ' + val.slice(pos);
-      const newPos = atIdx + wrappedPlaceholder.length + 1;
-      inputElement.setSelectionRange(newPos, newPos);
-    } else {
-      inputElement.value = val.slice(0, pos) + wrappedPlaceholder + ' ' + val.slice(pos);
-      const newPos = pos + wrappedPlaceholder.length + 1;
-      inputElement.setSelectionRange(newPos, newPos);
-    }
-    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
-    console.debug('[WebAiBridge] Inserted placeholder in textarea');
-  }
-  
-  // Update the floating chip bar
-  showContextChipBar(inputElement);
-  
-  return uniqueId;
-}
         // Escape special regex characters in the trigger
         const escapedTrigger = triggerSetting.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         
@@ -1044,38 +1084,34 @@ function setCaretPosition(element, position) {
  */
 function removeInlineChip(uniqueId) {
   // Find the context
-  const ctx = insertedContexts.find((c) => c.id === uniqueId);
-
+  const ctx = insertedContexts.find(c => c.id === uniqueId);
+  
   if (ctx && ctx.inputElement) {
     const placeholder = ctx.placeholder;
     const input = ctx.inputElement;
-
+    
     if (input.isContentEditable) {
       // Remove from contenteditable
-      const text = input.innerText || input.textContent || "";
+      const text = input.innerText || input.textContent || '';
       if (text.includes(placeholder)) {
-        input.innerText = text
-          .replace(placeholder + " ", "")
-          .replace(placeholder, "");
-        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.innerText = text.replace(placeholder + ' ', '').replace(placeholder, '');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
       }
     } else {
       // Remove from textarea/input
       if (input.value?.includes(placeholder)) {
-        input.value = input.value
-          .replace(placeholder + " ", "")
-          .replace(placeholder, "");
-        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.value = input.value.replace(placeholder + ' ', '').replace(placeholder, '');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
       }
     }
-
+    
     // Remove content mapping
     delete contextContents[placeholder];
   }
-
+  
   // Remove from tracking
-  insertedContexts = insertedContexts.filter((c) => c.id !== uniqueId);
-
+  insertedContexts = insertedContexts.filter(c => c.id !== uniqueId);
+  
   // Update chip bar
   if (insertedContexts.length === 0) {
     hideContextChipBar();
@@ -1088,54 +1124,41 @@ function removeInlineChip(uniqueId) {
  * Expand all placeholders in an element to their full content (called before submit)
  */
 function expandChipsToContent(element) {
-  console.debug("[WebAiBridge] expandChipsToContent called", {
+  console.debug('[WebAiBridge] expandChipsToContent called', {
     isContentEditable: element.isContentEditable,
     contextContentsKeys: Object.keys(contextContents),
-    insertedContextsCount: insertedContexts.length,
+    insertedContextsCount: insertedContexts.length
   });
-
+  
   // Get current text
-  let text = element.isContentEditable
-    ? element.innerText || element.textContent || ""
-    : element.value || "";
-
-  console.debug("[WebAiBridge] Original text length:", text.length);
-
+  let text = element.isContentEditable 
+    ? (element.innerText || element.textContent || '')
+    : (element.value || '');
+  
+  console.debug('[WebAiBridge] Original text length:', text.length);
+  
   // Replace each placeholder with its content (all occurrences)
-  insertedContexts.forEach((ctx) => {
+  insertedContexts.forEach(ctx => {
     const placeholder = ctx.placeholder;
-    const content = contextContents[placeholder] || ctx.content || "";
+    const content = contextContents[placeholder] || ctx.content || '';
 
     // Validate placeholder format (standard or Copilot format) before expanding
-    if (
-      typeof placeholder === "string" &&
-      isValidPlaceholder(placeholder) &&
-      content
-    ) {
+    if (typeof placeholder === 'string' && isValidPlaceholder(placeholder) && content) {
       if (text.includes(placeholder)) {
-        console.debug(
-          "[WebAiBridge] Expanding placeholder:",
-          placeholder,
-          "→",
-          content.length,
-          "chars",
-        );
+        console.debug('[WebAiBridge] Expanding placeholder:', placeholder, '→', content.length, 'chars');
         text = text.split(placeholder).join(content);
       }
     } else {
-      console.debug(
-        "[WebAiBridge] Skipping invalid or empty placeholder during expansion:",
-        placeholder,
-      );
+      console.debug('[WebAiBridge] Skipping invalid or empty placeholder during expansion:', placeholder);
     }
   });
-
+  
   const site = detectSite();
-
+  
   // Update the element - use modern APIs for contenteditable to avoid destroying structure
   if (element.isContentEditable) {
     // For Copilot/Quill editors, use Range-based replacement instead of innerText
-    if (site === "copilot" || site === "gemini") {
+    if (site === 'copilot' || site === 'gemini') {
       try {
         // Select all content and replace
         element.focus();
@@ -1146,10 +1169,7 @@ function expandChipsToContent(element) {
         sel.addRange(range);
         insertTextIntoCE(element, text);
       } catch (e) {
-        console.debug(
-          "[WebAiBridge] Range replacement failed, falling back to innerText",
-          e,
-        );
+        console.debug('[WebAiBridge] Range replacement failed, falling back to innerText', e);
         element.innerText = text;
       }
     } else {
@@ -1158,58 +1178,42 @@ function expandChipsToContent(element) {
   } else {
     element.value = text;
   }
-
+  
   // Clear tracked chips and reset counters
   insertedContexts = [];
   contextContents = {};
   usedPlaceholders = {};
   hideContextChipBar();
-
+  
   // Trigger events so the site recognizes the content change
   // Standard events
-  element.dispatchEvent(new Event("input", { bubbles: true }));
-  element.dispatchEvent(new Event("change", { bubbles: true }));
-
+  element.dispatchEvent(new Event('input', { bubbles: true }));
+  element.dispatchEvent(new Event('change', { bubbles: true }));
+  
   // For ProseMirror/Quill editors (Gemini, Claude), also dispatch textInput
-  if (site === "gemini" || site === "claude") {
+  if (site === 'gemini' || site === 'claude') {
     try {
-      const textInputEvent = new InputEvent("textInput", {
+      const textInputEvent = new InputEvent('textInput', {
         bubbles: true,
         cancelable: true,
-        data: text,
+        data: text
       });
       element.dispatchEvent(textInputEvent);
     } catch (e) {
-      console.debug("[WebAiBridge] textInput event not supported:", e);
+      console.debug('[WebAiBridge] textInput event not supported:', e);
     }
   }
-
-  console.debug(
-    "[WebAiBridge] Expansion complete, new text length:",
-    text.length,
-  );
+  
+  console.debug('[WebAiBridge] Expansion complete, new text length:', text.length);
 }
 
 /**
  * Legacy function for compatibility - now redirects to insertInlineChip
  */
-function addContextChip(
-  optionId,
-  label,
-  tokens,
-  inputElement,
-  content = "",
-  insertedText = "",
-) {
+function addContextChip(optionId, label, tokens, inputElement, content = '', insertedText = '') {
   // This is now handled by insertInlineChip
   // Keeping for any legacy calls
-  insertInlineChip(
-    optionId,
-    label,
-    tokens,
-    inputElement,
-    insertedText || content,
-  );
+  insertInlineChip(optionId, label, tokens, inputElement, insertedText || content);
 }
 
 /**
@@ -1226,20 +1230,20 @@ let chipBarPositionInterval = null;
  */
 function syncChipsWithText(inputElement) {
   if (!inputElement || insertedContexts.length === 0) return;
-
+  
   // Get current text from the input
-  let currentText = "";
-  if ("value" in inputElement && inputElement.tagName !== "DIV") {
-    currentText = inputElement.value || "";
+  let currentText = '';
+  if ('value' in inputElement && inputElement.tagName !== 'DIV') {
+    currentText = inputElement.value || '';
   } else if (inputElement.isContentEditable) {
-    currentText = inputElement.innerText || inputElement.textContent || "";
+    currentText = inputElement.innerText || inputElement.textContent || '';
   }
-
+  
   // Check each inserted context to see if its placeholder is still present
   const beforeCount = insertedContexts.length;
   const removedPlaceholders = [];
-
-  insertedContexts = insertedContexts.filter((ctx) => {
+  
+  insertedContexts = insertedContexts.filter(ctx => {
     const isPresent = currentText.includes(ctx.placeholder);
     if (!isPresent) {
       removedPlaceholders.push(ctx.placeholder);
@@ -1248,14 +1252,11 @@ function syncChipsWithText(inputElement) {
     }
     return isPresent;
   });
-
+  
   const afterCount = insertedContexts.length;
-
+  
   if (beforeCount !== afterCount) {
-    console.debug(
-      `[WebAiBridge] Synced chips: removed ${beforeCount - afterCount} orphaned chips`,
-      removedPlaceholders,
-    );
+    console.debug(`[WebAiBridge] Synced chips: removed ${beforeCount - afterCount} orphaned chips`, removedPlaceholders);
     // Update the chip bar
     if (insertedContexts.length === 0) {
       hideContextChipBar();
@@ -1267,7 +1268,7 @@ function syncChipsWithText(inputElement) {
 
 function updateChipBarPosition() {
   if (!contextChipBar || !chipBarInputElement) return;
-
+  
   const inputRect = chipBarInputElement.getBoundingClientRect();
   if (inputRect) {
     contextChipBar.style.left = `${inputRect.left}px`;
@@ -1281,62 +1282,58 @@ function showContextChipBar(inputElement) {
     hideContextChipBar();
     return;
   }
-
+  
   chipBarInputElement = inputElement;
-
+  
   if (!contextChipBar) {
-    contextChipBar = document.createElement("div");
-    contextChipBar.id = "webaibridge-chip-bar";
+    contextChipBar = document.createElement('div');
+    contextChipBar.id = 'webaibridge-chip-bar';
     document.body.appendChild(contextChipBar);
-
+    
     // Set up ResizeObserver to handle input/container resizing
-    if (typeof ResizeObserver !== "undefined") {
+    if (typeof ResizeObserver !== 'undefined') {
       chipBarResizeObserver = new ResizeObserver(() => {
         updateChipBarPosition();
       });
-
+      
       // Observe the input element itself for size changes
       if (inputElement) {
         chipBarResizeObserver.observe(inputElement);
       }
-
+      
       // Also observe the parent container for size changes
-      const container =
-        inputElement?.closest("form") || inputElement?.parentElement;
+      const container = inputElement?.closest('form') || inputElement?.parentElement;
       if (container) {
         chipBarResizeObserver.observe(container);
       }
     }
-
+    
     // Set up MutationObserver to detect DOM changes that might affect position
-    if (typeof MutationObserver !== "undefined" && inputElement) {
+    if (typeof MutationObserver !== 'undefined' && inputElement) {
       chipBarMutationObserver = new MutationObserver(() => {
         updateChipBarPosition();
       });
-
+      
       // Observe changes to the input element's attributes and subtree
       chipBarMutationObserver.observe(inputElement, {
         attributes: true,
-        attributeFilter: ["style", "class"],
+        attributeFilter: ['style', 'class'],
         childList: true,
-        subtree: true,
+        subtree: true
       });
     }
-
+    
     // Also update on window resize and scroll
-    window.addEventListener("resize", updateChipBarPosition);
-    window.addEventListener("scroll", updateChipBarPosition, true);
-
+    window.addEventListener('resize', updateChipBarPosition);
+    window.addEventListener('scroll', updateChipBarPosition, true);
+    
     // Polling fallback for cases where observers don't catch changes (e.g., Gemini's dynamic resizing)
     chipBarPositionInterval = setInterval(updateChipBarPosition, 500);
   }
-
+  
   // Calculate total tokens
-  const totalTokens = insertedContexts.reduce(
-    (sum, c) => sum + (c.tokens || 0),
-    0,
-  );
-
+  const totalTokens = insertedContexts.reduce((sum, c) => sum + (c.tokens || 0), 0);
+  
   // Position above the input element
   const inputRect = inputElement?.getBoundingClientRect();
   if (inputRect) {
@@ -1350,12 +1347,12 @@ function showContextChipBar(inputElement) {
       font-size: 12px;
     `;
   }
-
-  contextChipBar.innerHTML = "";
-
+  
+  contextChipBar.innerHTML = '';
+  
   // Create header with total tokens and hide toggle
-  const header = document.createElement("div");
-  header.className = "webaibridge-chip-header";
+  const header = document.createElement('div');
+  header.className = 'webaibridge-chip-header';
   header.style.cssText = `
     display: flex;
     justify-content: space-between;
@@ -1368,16 +1365,16 @@ function showContextChipBar(inputElement) {
     color: #888;
     font-size: 11px;
   `;
-
-  const totalLabel = document.createElement("span");
+  
+  const totalLabel = document.createElement('span');
   totalLabel.innerHTML = `<span style="color:#4ec9b0">📎 WebAiBridge Context</span> · <strong style="color:#9cdcfe">~${Tokenizer.formatTokenCount(totalTokens)}</strong> tokens`;
   header.appendChild(totalLabel);
-
-  const controls = document.createElement("div");
-  controls.style.cssText = "display:flex;gap:8px;align-items:center;";
-
+  
+  const controls = document.createElement('div');
+  controls.style.cssText = 'display:flex;gap:8px;align-items:center;';
+  
   // Hide/Show toggle
-  const hideBtn = document.createElement("button");
+  const hideBtn = document.createElement('button');
   hideBtn.style.cssText = `
     background: none;
     border: 1px solid #555;
@@ -1387,15 +1384,15 @@ function showContextChipBar(inputElement) {
     border-radius: 4px;
     font-size: 10px;
   `;
-  hideBtn.textContent = chipBarHidden ? "👁 Show" : "👁 Hide";
+  hideBtn.textContent = chipBarHidden ? '👁 Show' : '👁 Hide';
   hideBtn.onclick = () => {
     chipBarHidden = !chipBarHidden;
     showContextChipBar(inputElement);
   };
   controls.appendChild(hideBtn);
-
+  
   // Clear all button
-  const clearBtn = document.createElement("button");
+  const clearBtn = document.createElement('button');
   clearBtn.style.cssText = `
     background: none;
     border: 1px solid #666;
@@ -1405,16 +1402,16 @@ function showContextChipBar(inputElement) {
     border-radius: 4px;
     font-size: 10px;
   `;
-  clearBtn.textContent = "✕ Clear All";
+  clearBtn.textContent = '✕ Clear All';
   clearBtn.onclick = clearAllContextChips;
   controls.appendChild(clearBtn);
-
+  
   header.appendChild(controls);
   contextChipBar.appendChild(header);
-
+  
   // Chips container (collapsible)
   if (!chipBarHidden) {
-    const chipsContainer = document.createElement("div");
+    const chipsContainer = document.createElement('div');
     chipsContainer.style.cssText = `
       display: flex;
       flex-wrap: wrap;
@@ -1426,10 +1423,10 @@ function showContextChipBar(inputElement) {
       border-radius: 0 0 8px 8px;
       backdrop-filter: blur(8px);
     `;
-
+    
     // Add chips
-    insertedContexts.forEach((ctx) => {
-      const chip = document.createElement("div");
+    insertedContexts.forEach(ctx => {
+      const chip = document.createElement('div');
       chip.style.cssText = `
         display: inline-flex;
         align-items: center;
@@ -1443,32 +1440,28 @@ function showContextChipBar(inputElement) {
         cursor: pointer;
         transition: all 0.15s ease;
       `;
-
+      
       chip.onmouseenter = () => {
-        chip.style.background = "#3d3d3d";
-        chip.style.borderColor = "#4ec9b0";
+        chip.style.background = '#3d3d3d';
+        chip.style.borderColor = '#4ec9b0';
       };
       chip.onmouseleave = () => {
-        chip.style.background = "#2d2d2d";
-        chip.style.borderColor = "#404040";
+        chip.style.background = '#2d2d2d';
+        chip.style.borderColor = '#404040';
       };
-
-      const tokenText = ctx.tokens
-        ? `${Tokenizer.formatTokenCount(ctx.tokens)}`
-        : "";
-
+      
+      const tokenText = ctx.tokens ? `${Tokenizer.formatTokenCount(ctx.tokens)}` : '';
+      
       // Extract the short ID from the placeholder
       // Standard format: "@_focused-file[0de8e5ab]" -> "0de8e5ab"
       // Copilot format: "[[WAB::0de8e5ab::focused-file]]" -> "0de8e5ab"
-      let shortId = "";
+      let shortId = '';
       const stdMatch = ctx.placeholder.match(/\[([a-f0-9]+)\]/i);
       const wabMatch = ctx.placeholder.match(/\[\[WAB::([a-f0-9]+)::/i);
       if (stdMatch) shortId = stdMatch[1];
       else if (wabMatch) shortId = wabMatch[1];
-      const displayLabel = shortId
-        ? `${ctx.label} <span style="color:#888;font-size:10px">${shortId}</span>`
-        : ctx.label;
-
+      const displayLabel = shortId ? `${ctx.label} <span style="color:#888;font-size:10px">${shortId}</span>` : ctx.label;
+      
       chip.innerHTML = `
         <span style="font-size:16px">${ctx.icon}</span>
         <span style="color:#9cdcfe;font-weight:500">${displayLabel}</span>
@@ -1491,22 +1484,22 @@ function showContextChipBar(inputElement) {
           margin-left: 2px;
         " title="Remove">×</button>
       `;
-
+      
       // Click chip to preview
       chip.onclick = (e) => {
-        if (e.target.classList.contains("chip-remove")) return;
+        if (e.target.classList.contains('chip-remove')) return;
         showContentPreview(ctx);
       };
-
+      
       // Remove button handler
-      chip.querySelector(".chip-remove").onclick = (e) => {
+      chip.querySelector('.chip-remove').onclick = (e) => {
         e.stopPropagation();
         removeContextChip(ctx.id);
       };
-
+      
       chipsContainer.appendChild(chip);
     });
-
+    
     contextChipBar.appendChild(chipsContainer);
   }
 }
@@ -1516,15 +1509,12 @@ function showContextChipBar(inputElement) {
  */
 function showContentPreview(ctx) {
   closeContentPreview();
-
+  
   // Look up content by placeholder (new format) or fall back to ctx.content
-  const content =
-    contextContents[ctx.placeholder] ||
-    ctx.content ||
-    "(Content not available for preview)";
-
-  previewModal = document.createElement("div");
-  previewModal.id = "webaibridge-preview-modal";
+  const content = contextContents[ctx.placeholder] || ctx.content || '(Content not available for preview)';
+  
+  previewModal = document.createElement('div');
+  previewModal.id = 'webaibridge-preview-modal';
   previewModal.style.cssText = `
     position: fixed;
     top: 50%;
@@ -1542,9 +1532,9 @@ function showContentPreview(ctx) {
     display: flex;
     flex-direction: column;
   `;
-
+  
   // Header
-  const header = document.createElement("div");
+  const header = document.createElement('div');
   header.style.cssText = `
     display: flex;
     justify-content: space-between;
@@ -1570,9 +1560,9 @@ function showContentPreview(ctx) {
     ">×</button>
   `;
   previewModal.appendChild(header);
-
+  
   // Content
-  const contentArea = document.createElement("pre");
+  const contentArea = document.createElement('pre');
   contentArea.style.cssText = `
     margin: 0;
     padding: 16px;
@@ -1586,14 +1576,13 @@ function showContentPreview(ctx) {
     white-space: pre-wrap;
     word-break: break-word;
   `;
-  contentArea.textContent =
-    content.length > 50000
-      ? content.substring(0, 50000) + "\n\n... (truncated for preview)"
-      : content;
+  contentArea.textContent = content.length > 50000 
+    ? content.substring(0, 50000) + '\n\n... (truncated for preview)' 
+    : content;
   previewModal.appendChild(contentArea);
-
+  
   // Footer
-  const footer = document.createElement("div");
+  const footer = document.createElement('div');
   footer.style.cssText = `
     padding: 10px 16px;
     border-top: 1px solid #3c3c3c;
@@ -1621,10 +1610,10 @@ function showContentPreview(ctx) {
     ">Close</button>
   `;
   previewModal.appendChild(footer);
-
+  
   // Backdrop
-  const backdrop = document.createElement("div");
-  backdrop.id = "webaibridge-preview-backdrop";
+  const backdrop = document.createElement('div');
+  backdrop.id = 'webaibridge-preview-backdrop';
   backdrop.style.cssText = `
     position: fixed;
     top: 0;
@@ -1635,15 +1624,14 @@ function showContentPreview(ctx) {
     z-index: 2147483646;
   `;
   backdrop.onclick = closeContentPreview;
-
+  
   document.body.appendChild(backdrop);
   document.body.appendChild(previewModal);
-
+  
   // Event handlers
-  previewModal.querySelector("#close-preview").onclick = closeContentPreview;
-  previewModal.querySelector("#close-preview-btn").onclick =
-    closeContentPreview;
-  previewModal.querySelector("#remove-from-preview").onclick = () => {
+  previewModal.querySelector('#close-preview').onclick = closeContentPreview;
+  previewModal.querySelector('#close-preview-btn').onclick = closeContentPreview;
+  previewModal.querySelector('#remove-from-preview').onclick = () => {
     removeContextChip(ctx.id);
     closeContentPreview();
   };
@@ -1653,8 +1641,8 @@ function showContentPreview(ctx) {
  * Close content preview modal
  */
 function closeContentPreview() {
-  const modal = document.getElementById("webaibridge-preview-modal");
-  const backdrop = document.getElementById("webaibridge-preview-backdrop");
+  const modal = document.getElementById('webaibridge-preview-modal');
+  const backdrop = document.getElementById('webaibridge-preview-backdrop');
   if (modal) modal.remove();
   if (backdrop) backdrop.remove();
   previewModal = null;
@@ -1672,30 +1660,26 @@ function removeContextChip(id) {
  */
 function clearAllContextChips() {
   // Remove all placeholders from the input
-  insertedContexts.forEach((ctx) => {
+  insertedContexts.forEach(ctx => {
     if (ctx.inputElement && ctx.placeholder) {
       const input = ctx.inputElement;
       const placeholder = ctx.placeholder;
-
+      
       if (input.isContentEditable) {
-        const text = input.innerText || input.textContent || "";
+        const text = input.innerText || input.textContent || '';
         if (text.includes(placeholder)) {
-          input.innerText = text
-            .replace(placeholder + " ", "")
-            .replace(placeholder, "");
-          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.innerText = text.replace(placeholder + ' ', '').replace(placeholder, '');
+          input.dispatchEvent(new Event('input', { bubbles: true }));
         }
       } else {
         if (input.value?.includes(placeholder)) {
-          input.value = input.value
-            .replace(placeholder + " ", "")
-            .replace(placeholder, "");
-          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.value = input.value.replace(placeholder + ' ', '').replace(placeholder, '');
+          input.dispatchEvent(new Event('input', { bubbles: true }));
         }
       }
     }
   });
-
+  
   insertedContexts = [];
   contextContents = {};
   usedPlaceholders = {};
@@ -1712,41 +1696,38 @@ function hideContextChipBar() {
     contextChipBar.remove();
     contextChipBar = null;
   }
-
+  
   // Clean up ResizeObserver
   if (chipBarResizeObserver) {
     chipBarResizeObserver.disconnect();
     chipBarResizeObserver = null;
   }
-
+  
   // Clean up MutationObserver
   if (chipBarMutationObserver) {
     chipBarMutationObserver.disconnect();
     chipBarMutationObserver = null;
   }
-
+  
   // Clean up polling interval
   if (chipBarPositionInterval) {
     clearInterval(chipBarPositionInterval);
     chipBarPositionInterval = null;
   }
-
+  
   chipBarInputElement = null;
-  window.removeEventListener("resize", updateChipBarPosition);
-  window.removeEventListener("scroll", updateChipBarPosition, true);
+  window.removeEventListener('resize', updateChipBarPosition);
+  window.removeEventListener('scroll', updateChipBarPosition, true);
 }
 
 // ==================== @ Mention Popover ====================
 
 function createMentionPopover(inputElement) {
-  console.debug(
-    "[WebAiBridge] createMentionPopover called; inputElement=",
-    inputElement,
-  );
+  console.debug('[WebAiBridge] createMentionPopover called; inputElement=', inputElement);
   removeMentionPopover();
-
-  mentionPopover = document.createElement("div");
-  mentionPopover.id = "webaibridge-mention-popover";
+  
+  mentionPopover = document.createElement('div');
+  mentionPopover.id = 'webaibridge-mention-popover';
   mentionPopover.style.cssText = `
     position: fixed;
     background: #1e1e1e;
@@ -1763,7 +1744,7 @@ function createMentionPopover(inputElement) {
     color: #cccccc;
     padding: 4px 0;
   `;
-
+  
   // Position near the caret
   const rect = getCaretPosition(inputElement);
   if (rect) {
@@ -1775,9 +1756,9 @@ function createMentionPopover(inputElement) {
     mentionPopover.style.left = `${inputRect.left}px`;
     mentionPopover.style.bottom = `${window.innerHeight - inputRect.top + 8}px`;
   }
-
+  
   // Header with site-specific trigger hint
-  const header = document.createElement("div");
+  const header = document.createElement('div');
   header.style.cssText = `
     padding: 8px 12px 6px;
     font-size: 11px;
@@ -1788,78 +1769,61 @@ function createMentionPopover(inputElement) {
     margin-bottom: 4px;
   `;
   const site = detectSite();
-  if (site === "copilot") {
-    header.textContent = "Add Context from VS Code (// or /wab)";
+  if (site === 'copilot') {
+    header.textContent = 'Add Context from VS Code (// or /wab)';
   } else {
-    header.textContent = "Add Context from VS Code (@ or #)";
+    header.textContent = 'Add Context from VS Code (@ or #)';
   }
   mentionPopover.appendChild(header);
-
+  
   updateMentionOptions();
   document.body.appendChild(mentionPopover);
-
+  
   // Request token counts from VS Code
   requestContextInfo();
 }
 
 function updateMentionOptions() {
   if (!mentionPopover) {
-    console.debug(
-      "[WebAiBridge] updateMentionOptions called but mentionPopover is null",
-    );
+    console.debug('[WebAiBridge] updateMentionOptions called but mentionPopover is null');
     return;
   }
-  console.debug(
-    "[WebAiBridge] updateMentionOptions; isFilePickerMode=",
-    isFilePickerMode,
-    "query=",
-    mentionQuery,
-    "workspaceFiles=",
-    (workspaceFiles || []).length,
-  );
-
+  console.debug('[WebAiBridge] updateMentionOptions; isFilePickerMode=', isFilePickerMode, 'query=', mentionQuery, 'workspaceFiles=', (workspaceFiles||[]).length);
+  
   // Remove existing options (keep header)
   const header = mentionPopover.firstChild;
-  mentionPopover.innerHTML = "";
+  mentionPopover.innerHTML = '';
   mentionPopover.appendChild(header);
-
+  
   // Filter options based on query
   const query = mentionQuery.toLowerCase();
   let filtered;
   if (isFilePickerMode) {
     // Filter workspace files by label and use file path as stable ID
     filtered = workspaceFiles
-      .filter((f) => f.label.toLowerCase().includes(query))
+      .filter(f => f.label.toLowerCase().includes(query))
       .slice(0, 50)
-      .map((f) => ({
-        id: `filepath::${encodeURIComponent(f.path)}`,
-        path: f.path,
-        icon: "📄",
-        label: f.label,
-        description: f.languageId || "",
-        tokens: null,
-      }));
+      .map((f) => ({ id: `filepath::${encodeURIComponent(f.path)}`, path: f.path, icon: '📄', label: f.label, description: f.languageId || '', tokens: null }));
   } else {
-    filtered = mentionOptions.filter(
-      (opt) =>
-        opt.label.toLowerCase().includes(query) ||
-        opt.description.toLowerCase().includes(query),
+    filtered = mentionOptions.filter(opt => 
+      opt.label.toLowerCase().includes(query) || 
+      opt.description.toLowerCase().includes(query)
     );
   }
-
+  
   if (filtered.length === 0) {
-    const noResults = document.createElement("div");
-    noResults.style.cssText = "padding: 12px; color: #888; text-align: center;";
-    noResults.textContent = "No matching context options";
+    const noResults = document.createElement('div');
+    noResults.style.cssText = 'padding: 12px; color: #888; text-align: center;';
+    noResults.textContent = 'No matching context options';
     mentionPopover.appendChild(noResults);
     return;
   }
-
+  
   selectedMentionIndex = Math.min(selectedMentionIndex, filtered.length - 1);
-
+  
   filtered.forEach((opt, index) => {
-    const item = document.createElement("div");
-    item.className = "webaibridge-mention-item";
+    const item = document.createElement('div');
+    item.className = 'webaibridge-mention-item';
     item.dataset.id = opt.id;
     item.style.cssText = `
       display: flex;
@@ -1867,29 +1831,29 @@ function updateMentionOptions() {
       padding: 8px 12px;
       cursor: pointer;
       transition: background 0.1s;
-      ${index === selectedMentionIndex ? "background: #094771;" : ""}
+      ${index === selectedMentionIndex ? 'background: #094771;' : ''}
     `;
-
+    
     item.innerHTML = `
       <span style="font-size: 16px; margin-right: 10px; width: 24px; text-align: center;">${opt.icon}</span>
       <div style="flex: 1; min-width: 0;">
         <div style="font-weight: 500; color: #e0e0e0;">${highlightMatch(opt.label, query)}</div>
         <div style="font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${opt.description}</div>
       </div>
-      ${opt.tokens !== null ? `<span style="font-size: 11px; color: #4ec9b0; margin-left: 8px; font-weight: 600;">${formatTokens(opt.tokens)}</span>` : ""}
+      ${opt.tokens !== null ? `<span style="font-size: 11px; color: #4ec9b0; margin-left: 8px; font-weight: 600;">${formatTokens(opt.tokens)}</span>` : ''}
     `;
-
-    item.addEventListener("mouseenter", () => {
+    
+    item.addEventListener('mouseenter', () => {
       selectedMentionIndex = index;
       updateMentionSelection();
     });
-
-    item.addEventListener("click", (e) => {
+    
+    item.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       selectMentionOption(opt.id);
     });
-
+    
     mentionPopover.appendChild(item);
   });
 }
@@ -1898,33 +1862,25 @@ function highlightMatch(text, query) {
   if (!query) return text;
   const idx = text.toLowerCase().indexOf(query);
   if (idx === -1) return text;
-  return (
-    text.slice(0, idx) +
-    '<span style="color:#4ec9b0;">' +
-    text.slice(idx, idx + query.length) +
-    "</span>" +
-    text.slice(idx + query.length)
-  );
+  return text.slice(0, idx) + '<span style="color:#4ec9b0;">' + text.slice(idx, idx + query.length) + '</span>' + text.slice(idx + query.length);
 }
 
 function formatTokens(tokens) {
   if (tokens >= 1000) {
-    return (tokens / 1000).toFixed(1).replace(/\.0$/, "") + "K";
+    return (tokens / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
   }
   return tokens.toString();
 }
 
 function updateMentionSelection() {
   if (!mentionPopover) return;
-  const items = mentionPopover.querySelectorAll(".webaibridge-mention-item");
+  const items = mentionPopover.querySelectorAll('.webaibridge-mention-item');
   items.forEach((item, idx) => {
     if (idx === selectedMentionIndex) {
-      item.style.background = "#094771";
-      try {
-        item.scrollIntoView({ block: "nearest" });
-      } catch (e) {}
+      item.style.background = '#094771';
+      try { item.scrollIntoView({ block: 'nearest' }); } catch (e) {}
     } else {
-      item.style.background = "";
+      item.style.background = '';
     }
   });
 }
@@ -1934,11 +1890,11 @@ function removeMentionPopover() {
     mentionPopover.remove();
     mentionPopover = null;
   }
-  mentionQuery = "";
+  mentionQuery = '';
   mentionStartPos = -1;
   mentionRange = null;
   mentionTriggerOffset = -1;
-  mentionFullTextAtTrigger = "";
+  mentionFullTextAtTrigger = '';
   selectedMentionIndex = 0;
   // Reset file picker state when popover closes
   isFilePickerMode = false;
@@ -1955,9 +1911,9 @@ function getCaretPosition(element) {
         const rect = range.getClientRects()[0];
         if (rect) return rect;
       }
-    } else if ("selectionStart" in element) {
+    } else if ('selectionStart' in element) {
       // For textarea/input, create a hidden mirror div
-      const mirror = document.createElement("div");
+      const mirror = document.createElement('div');
       const computed = getComputedStyle(element);
       mirror.style.cssText = `
         position: absolute;
@@ -1971,22 +1927,22 @@ function getCaretPosition(element) {
       `;
       const text = element.value.substring(0, element.selectionStart);
       mirror.textContent = text;
-      const span = document.createElement("span");
-      span.textContent = "|";
+      const span = document.createElement('span');
+      span.textContent = '|';
       mirror.appendChild(span);
       document.body.appendChild(mirror);
-
+      
       const rect = element.getBoundingClientRect();
       const spanRect = span.getBoundingClientRect();
       const result = {
         left: rect.left + spanRect.left - mirror.getBoundingClientRect().left,
-        top: rect.top + spanRect.top - mirror.getBoundingClientRect().top,
+        top: rect.top + spanRect.top - mirror.getBoundingClientRect().top
       };
       mirror.remove();
       return result;
     }
   } catch (e) {
-    console.debug("getCaretPosition failed", e);
+    console.debug('getCaretPosition failed', e);
   }
   return null;
 }
@@ -1997,7 +1953,7 @@ function selectMentionOption(optionId) {
     removeMentionPopover();
     return;
   }
-
+  
   // Store the position info before removing popover
   const savedStartPos = mentionStartPos;
   const savedQuery = mentionQuery;
@@ -2005,84 +1961,64 @@ function selectMentionOption(optionId) {
   const savedRange = mentionRange ? mentionRange.cloneRange() : null; // Clone the stored Range
   const savedTriggerOffset = mentionTriggerOffset;
   const savedFullText = mentionFullTextAtTrigger;
-
+  
   // Handle file-picker trigger
-  if (optionId === "file-search") {
+  if (optionId === 'file-search') {
     // Enter file picker mode (do not close popover)
     enterFilePickerMode();
     return;
   }
 
   // If selecting a file from file-picker, optionId will be filepath::ENCODED_PATH
-  if (optionId && optionId.startsWith("filepath::")) {
-    const encoded = optionId.split("::")[1] || "";
+  if (optionId && optionId.startsWith('filepath::')) {
+    const encoded = optionId.split('::')[1] || '';
     const filePath = decodeURIComponent(encoded);
-    const fileEntry = workspaceFiles.find((f) => f.path === filePath);
+    const fileEntry = workspaceFiles.find(f => f.path === filePath);
     if (!fileEntry) return;
 
     // Close popover (don't call removeAtQueryFromElement - insertInlineChip handles removal)
     removeMentionPopover();
 
     // Insert placeholder chip for the file and prefetch content asynchronously
-    console.debug("Inserting file chip for:", fileEntry.label);
+    console.debug('Inserting file chip for:', fileEntry.label);
     showLoadingIndicator(savedInput);
-
+    
     // Insert chip immediately using saved position info
-    const uniqueId = insertInlineChip(
-      "file",
-      fileEntry.label,
-      null,
-      savedInput,
-      null,
-      savedRange,
-      savedQuery,
-    );
-
+    const uniqueId = insertInlineChip('file', fileEntry.label, null, savedInput, null, savedRange, savedQuery);
+    
     // Find the inserted context and attach filePath
-    const ctx = insertedContexts.find((c) => c.id === uniqueId);
+    const ctx = insertedContexts.find(c => c.id === uniqueId);
     if (ctx) {
       ctx.filePath = fileEntry.path;
       // Ensure mapping exists (may be null initially)
-      contextContents[ctx.placeholder] =
-        contextContents[ctx.placeholder] || null;
+      contextContents[ctx.placeholder] = contextContents[ctx.placeholder] || null;
       // Prefetch file content from VS Code
-      chrome.runtime.sendMessage(
-        {
-          type: "REQUEST_CONTEXT",
-          contextType: "file",
-          filePath: fileEntry.path,
-        },
-        (resp) => {
-          hideLoadingIndicator();
-          if (!resp) {
-            console.debug("Empty response for file content", fileEntry.path);
-            return;
-          }
+      chrome.runtime.sendMessage({ type: 'REQUEST_CONTEXT', contextType: 'file', filePath: fileEntry.path }, (resp) => {
+        hideLoadingIndicator();
+        if (!resp) {
+          console.debug('Empty response for file content', fileEntry.path);
+          return;
+        }
 
-          if (resp.stream && Array.isArray(resp.chunks)) {
-            // Assemble streamed chunks
-            try {
-              const joined = resp.chunks.map((c) => c.text).join("");
-              const header = `/* FILE: ${fileEntry.label} (${fileEntry.languageId || "file"}) */\n`;
-              contextContents[ctx.placeholder] = header + joined;
-              ctx.tokens = estimateTokens(contextContents[ctx.placeholder]);
-              showContextChipBar(savedInput);
-            } catch (e) {
-              console.debug("Failed to assemble streamed file chunks", e);
-            }
-          } else if (resp?.text) {
-            contextContents[ctx.placeholder] = resp.text;
-            ctx.tokens = estimateTokens(resp.text);
+        if (resp.stream && Array.isArray(resp.chunks)) {
+          // Assemble streamed chunks
+          try {
+            const joined = resp.chunks.map(c => c.text).join('');
+            const header = `/* FILE: ${fileEntry.label} (${fileEntry.languageId || 'file'}) */\n`;
+            contextContents[ctx.placeholder] = header + joined;
+            ctx.tokens = estimateTokens(contextContents[ctx.placeholder]);
             showContextChipBar(savedInput);
-          } else {
-            console.debug(
-              "File content not returned for",
-              fileEntry.path,
-              resp,
-            );
+          } catch (e) {
+            console.debug('Failed to assemble streamed file chunks', e);
           }
-        },
-      );
+        } else if (resp?.text) {
+          contextContents[ctx.placeholder] = resp.text;
+          ctx.tokens = estimateTokens(resp.text);
+          showContextChipBar(savedInput);
+        } else {
+          console.debug('File content not returned for', fileEntry.path, resp);
+        }
+      });
     } else {
       hideLoadingIndicator();
     }
@@ -2092,124 +2028,87 @@ function selectMentionOption(optionId) {
   // Default behavior: request context from VS Code, insert chip using saved range
   // Close popover (insertInlineChip handles removal using savedRange)
   removeMentionPopover();
-
+  
   // Show loading indicator
-  console.debug("Requesting context:", optionId);
+  console.debug('Requesting context:', optionId);
   showLoadingIndicator(savedInput);
-
+  
   // Request the context from VS Code
-  chrome.runtime.sendMessage(
-    {
-      type: "REQUEST_CONTEXT",
-      contextType: optionId,
-    },
-    async (response) => {
-      console.debug("[WebAiBridge] Context response received:", {
-        hasText: !!response?.text,
-        textLen: response?.text?.length,
-        label: response?.label,
-        tokens: response?.tokens,
-      });
-      hideLoadingIndicator();
-
-      if (chrome.runtime.lastError) {
-        console.error("Chrome runtime error:", chrome.runtime.lastError);
-        showErrorNotification(
-          "Failed to get context: " + chrome.runtime.lastError.message,
-        );
-        return;
-      }
-
-      if (response?.text) {
-        // Apply limit mode handling
-        const limitResult = await applyLimitMode(response.text);
-        console.debug("Limit result:", limitResult);
-
-        // Get label for chip (use filename if available, else option label)
-        const option = mentionOptions.find((o) => o.id === optionId);
-        const chipLabel = response.label || option?.label || optionId;
-        console.debug(
-          "[WebAiBridge] Using chipLabel:",
-          chipLabel,
-          "response.label was:",
-          response.label,
-        );
-        const contentToInsert = limitResult.text;
-
-        switch (limitResult.action) {
-          case "insert":
-            // Insert inline chip using saved position info
-            insertInlineChip(
-              optionId,
-              chipLabel,
-              limitResult.tokens,
-              savedInput,
-              contentToInsert,
-              savedRange,
-              savedQuery,
-            );
-            if (limitResult.wasTruncated) {
-              showNotification(
-                `Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`,
-                "warning",
-              );
+  chrome.runtime.sendMessage({ 
+    type: 'REQUEST_CONTEXT', 
+    contextType: optionId 
+  }, async (response) => {
+    console.debug('[WebAiBridge] Context response received:', { 
+      hasText: !!response?.text, 
+      textLen: response?.text?.length,
+      label: response?.label,
+      tokens: response?.tokens 
+    });
+    hideLoadingIndicator();
+    
+    if (chrome.runtime.lastError) {
+      console.error('Chrome runtime error:', chrome.runtime.lastError);
+      showErrorNotification('Failed to get context: ' + chrome.runtime.lastError.message);
+      return;
+    }
+    
+    if (response?.text) {
+      // Apply limit mode handling
+      const limitResult = await applyLimitMode(response.text);
+      console.debug('Limit result:', limitResult);
+      
+      // Get label for chip (use filename if available, else option label)
+      const option = mentionOptions.find(o => o.id === optionId);
+      const chipLabel = response.label || option?.label || optionId;
+      console.debug('[WebAiBridge] Using chipLabel:', chipLabel, 'response.label was:', response.label);
+      const contentToInsert = limitResult.text;
+      
+      switch (limitResult.action) {
+        case 'insert':
+          // Insert inline chip using saved position info
+          insertInlineChip(optionId, chipLabel, limitResult.tokens, savedInput, contentToInsert, savedRange, savedQuery);
+          if (limitResult.wasTruncated) {
+            showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
+          }
+          break;
+          
+        case 'warn':
+          // Show warning dialog
+          showLimitWarning(
+            limitResult.tokens, 
+            limitResult.limit,
+            () => {
+              // User chose to proceed - insert inline chip
+              insertInlineChip(optionId, chipLabel, limitResult.tokens, savedInput, contentToInsert, savedRange, savedQuery);
+            },
+            () => {
+              // User cancelled - do nothing
+              console.debug('User cancelled insertion');
             }
-            break;
-
-          case "warn":
-            // Show warning dialog
-            showLimitWarning(
-              limitResult.tokens,
-              limitResult.limit,
-              () => {
-                // User chose to proceed - insert inline chip
-                insertInlineChip(
-                  optionId,
-                  chipLabel,
-                  limitResult.tokens,
-                  savedInput,
-                  contentToInsert,
-                  savedRange,
-                  savedQuery,
-                );
-              },
-              () => {
-                // User cancelled - do nothing
-                console.debug("User cancelled insertion");
-              },
-            );
-            break;
-
-          case "chunk":
-            // Show chunk navigator - don't add a chip here since chunks are inserted individually
-            showChunkNavigator(
-              limitResult.chunks,
-              savedInput,
-              optionId,
-              chipLabel,
-              response.text,
-            );
-            break;
-        }
-      } else if (response?.error) {
-        console.error("Context request failed:", response.error);
-        showErrorNotification("Context request failed: " + response.error);
-      } else {
-        console.error("No response received from background");
-        showErrorNotification(
-          "No response from VS Code. Is the extension running?",
-        );
+          );
+          break;
+          
+        case 'chunk':
+          // Show chunk navigator - don't add a chip here since chunks are inserted individually
+          showChunkNavigator(limitResult.chunks, savedInput, optionId, chipLabel, response.text);
+          break;
       }
-    },
-  );
+    } else if (response?.error) {
+      console.error('Context request failed:', response.error);
+      showErrorNotification('Context request failed: ' + response.error);
+    } else {
+      console.error('No response received from background');
+      showErrorNotification('No response from VS Code. Is the extension running?');
+    }
+  });
 }
 
 let loadingIndicator = null;
 
 function showLoadingIndicator(nearElement) {
   hideLoadingIndicator();
-  loadingIndicator = document.createElement("div");
-  loadingIndicator.id = "webaibridge-loading";
+  loadingIndicator = document.createElement('div');
+  loadingIndicator.id = 'webaibridge-loading';
   loadingIndicator.style.cssText = `
     position: fixed;
     background: #1e1e1e;
@@ -2222,12 +2121,12 @@ function showLoadingIndicator(nearElement) {
     z-index: 2147483647;
     box-shadow: 0 4px 12px rgba(0,0,0,0.3);
   `;
-  loadingIndicator.innerHTML = "⏳ Fetching context from VS Code...";
-
+  loadingIndicator.innerHTML = '⏳ Fetching context from VS Code...';
+  
   const rect = nearElement.getBoundingClientRect();
   loadingIndicator.style.left = `${rect.left}px`;
   loadingIndicator.style.bottom = `${window.innerHeight - rect.top + 8}px`;
-
+  
   document.body.appendChild(loadingIndicator);
 }
 
@@ -2239,7 +2138,7 @@ function hideLoadingIndicator() {
 }
 
 function showErrorNotification(message) {
-  const notif = document.createElement("div");
+  const notif = document.createElement('div');
   notif.style.cssText = `
     position: fixed;
     bottom: 20px;
@@ -2257,21 +2156,21 @@ function showErrorNotification(message) {
   `;
   notif.textContent = message;
   document.body.appendChild(notif);
-
+  
   setTimeout(() => notif.remove(), 5000);
 }
 
 function removeAtQueryFromElement(element, startPos, query) {
   if (startPos === -1) return;
-
+  
   const site = detectSite();
-
+  
   try {
-    if ("value" in element && element.tagName !== "DIV") {
+    if ('value' in element && element.tagName !== 'DIV') {
       const val = element.value;
       // Calculate trigger length based on site
       let triggerLen = 1; // Default for @ or #
-      if (site === "copilot") {
+      if (site === 'copilot') {
         // Check if it was // or /wab trigger
         const before = val.slice(0, startPos + query.length + 5);
         if (before.match(/\/wab\s*$/i)) {
@@ -2285,7 +2184,7 @@ function removeAtQueryFromElement(element, startPos, query) {
       const after = val.slice(startPos + queryLen);
       element.value = before + after;
       element.setSelectionRange(startPos, startPos);
-      element.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event('input', { bubbles: true }));
     } else if (element.isContentEditable) {
       // For contenteditable, we need to find and remove the trigger+query
       const sel = window.getSelection();
@@ -2296,23 +2195,20 @@ function removeAtQueryFromElement(element, startPos, query) {
           const text = container.textContent;
           // Find the trigger character(s) before cursor
           let triggerIdx = -1;
-          if (site === "copilot") {
+          if (site === 'copilot') {
             // Look for // or /wab
-            const slashIdx = text.lastIndexOf("//", range.startOffset);
-            const wabIdx = text
-              .toLowerCase()
-              .lastIndexOf("/wab", range.startOffset);
+            const slashIdx = text.lastIndexOf('//', range.startOffset);
+            const wabIdx = text.toLowerCase().lastIndexOf('/wab', range.startOffset);
             triggerIdx = Math.max(slashIdx, wabIdx);
           } else {
             // Look for @ or #
-            const atIdx = text.lastIndexOf("@", range.startOffset);
-            const hashIdx = text.lastIndexOf("#", range.startOffset);
+            const atIdx = text.lastIndexOf('@', range.startOffset);
+            const hashIdx = text.lastIndexOf('#', range.startOffset);
             triggerIdx = Math.max(atIdx, hashIdx);
           }
-
+          
           if (triggerIdx >= 0) {
-            const newText =
-              text.slice(0, triggerIdx) + text.slice(range.startOffset);
+            const newText = text.slice(0, triggerIdx) + text.slice(range.startOffset);
             container.textContent = newText;
             // Set cursor position
             const newRange = document.createRange();
@@ -2320,29 +2216,29 @@ function removeAtQueryFromElement(element, startPos, query) {
             newRange.collapse(true);
             sel.removeAllRanges();
             sel.addRange(newRange);
-            element.dispatchEvent(new Event("input", { bubbles: true }));
+            element.dispatchEvent(new Event('input', { bubbles: true }));
           }
         }
       }
     }
   } catch (e) {
-    console.debug("removeAtQueryFromElement failed", e);
+    console.debug('removeAtQueryFromElement failed', e);
   }
 }
 
 function requestContextInfo() {
   // Request token counts for each option from VS Code
-  chrome.runtime.sendMessage({ type: "GET_CONTEXT_INFO" }, (response) => {
+  chrome.runtime.sendMessage({ type: 'GET_CONTEXT_INFO' }, (response) => {
     if (response?.contextInfo) {
       // Update token counts and labels in mentionOptions
       for (const [id, info] of Object.entries(response.contextInfo)) {
-        const opt = mentionOptions.find((o) => o.id === id);
+        const opt = mentionOptions.find(o => o.id === id);
         if (opt) {
           if (info.tokens !== undefined) {
             opt.tokens = info.tokens;
           }
           // Update label for focused-file to show actual filename
-          if (id === "focused-file" && info.label) {
+          if (id === 'focused-file' && info.label) {
             opt.label = `Focused File (${info.label})`;
             opt.description = info.label;
           }
@@ -2356,19 +2252,19 @@ function requestContextInfo() {
 function enterFilePickerMode() {
   const input = lastFocusedInput || findChatInput();
   if (!input) return;
-  console.debug("[WebAiBridge] enterFilePickerMode");
+  console.debug('[WebAiBridge] enterFilePickerMode');
   isFilePickerMode = true;
   workspaceFiles = [];
   showLoadingIndicator(input);
-  chrome.runtime.sendMessage({ type: "REQUEST_FILE_LIST" }, (response) => {
+  chrome.runtime.sendMessage({ type: 'REQUEST_FILE_LIST' }, (response) => {
     hideLoadingIndicator();
     if (response?.files && Array.isArray(response.files)) {
       workspaceFiles = response.files;
-      mentionQuery = "";
+      mentionQuery = '';
       selectedMentionIndex = 0;
       updateMentionOptions();
     } else {
-      showNotification("No files returned from VS Code", "warning");
+      showNotification('No files returned from VS Code', 'warning');
       isFilePickerMode = false;
     }
   });
@@ -2376,53 +2272,44 @@ function enterFilePickerMode() {
 
 function handleMentionKeydown(e) {
   if (!mentionPopover) return false;
-
+  
   const query = mentionQuery.toLowerCase();
   // Use same filtering as updateMentionOptions so keyboard navigation matches displayed items
   let filtered;
   if (isFilePickerMode) {
     filtered = workspaceFiles
-      .filter((f) => f.label.toLowerCase().includes(query))
+      .filter(f => f.label.toLowerCase().includes(query))
       .slice(0, 50)
-      .map((f) => ({
-        id: `filepath::${encodeURIComponent(f.path)}`,
-        path: f.path,
-        label: f.label,
-        description: f.languageId || "",
-      }));
+      .map(f => ({ id: `filepath::${encodeURIComponent(f.path)}`, path: f.path, label: f.label, description: f.languageId || '' }));
   } else {
-    filtered = mentionOptions.filter(
-      (opt) =>
-        opt.label.toLowerCase().includes(query) ||
-        opt.description.toLowerCase().includes(query),
+    filtered = mentionOptions.filter(opt => 
+      opt.label.toLowerCase().includes(query) || 
+      opt.description.toLowerCase().includes(query)
     );
   }
-
-  if (e.key === "ArrowDown") {
+  
+  if (e.key === 'ArrowDown') {
     e.preventDefault();
     selectedMentionIndex = (selectedMentionIndex + 1) % (filtered.length || 1);
     updateMentionSelection();
     return true;
   }
-
-  if (e.key === "ArrowUp") {
+  
+  if (e.key === 'ArrowUp') {
     e.preventDefault();
-    selectedMentionIndex =
-      (selectedMentionIndex - 1 + (filtered.length || 1)) %
-      (filtered.length || 1);
+    selectedMentionIndex = (selectedMentionIndex - 1 + (filtered.length || 1)) % (filtered.length || 1);
     updateMentionSelection();
     return true;
   }
-
-  if (e.key === "Enter" || e.key === "Tab") {
+  
+  if (e.key === 'Enter' || e.key === 'Tab') {
     if (filtered.length > 0) {
       e.preventDefault();
       // Map to correct ID format (files use filepath::encodedpath)
       const sel = filtered[selectedMentionIndex];
       let selectedId = null;
       if (isFilePickerMode) {
-        if (sel && sel.path)
-          selectedId = `filepath::${encodeURIComponent(sel.path)}`;
+        if (sel && sel.path) selectedId = `filepath::${encodeURIComponent(sel.path)}`;
       } else {
         if (sel && sel.id) selectedId = sel.id;
       }
@@ -2430,35 +2317,32 @@ function handleMentionKeydown(e) {
       return true;
     }
   }
-
-  if (e.key === "Escape") {
+  
+  if (e.key === 'Escape') {
     e.preventDefault();
     removeMentionPopover();
     return true;
   }
-
+  
   return false;
 }
 
 // Cached trigger setting
-let cachedTriggerChar = "@";
+let cachedTriggerChar = '@';
 
 // Load trigger setting from storage
 function loadTriggerSetting() {
-  chrome.storage.local.get(["triggerChar"], (res) => {
-    cachedTriggerChar = res?.triggerChar || "@";
-    console.debug("[WebAiBridge] Trigger character loaded:", cachedTriggerChar);
+  chrome.storage.local.get(['triggerChar'], (res) => {
+    cachedTriggerChar = res?.triggerChar || '@';
+    console.debug('[WebAiBridge] Trigger character loaded:', cachedTriggerChar);
   });
 }
 
 // Listen for storage changes to update trigger
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.triggerChar) {
-    cachedTriggerChar = changes.triggerChar.newValue || "@";
-    console.debug(
-      "[WebAiBridge] Trigger character updated:",
-      cachedTriggerChar,
-    );
+  if (area === 'local' && changes.triggerChar) {
+    cachedTriggerChar = changes.triggerChar.newValue || '@';
+    console.debug('[WebAiBridge] Trigger character updated:', cachedTriggerChar);
   }
 });
 
@@ -2467,25 +2351,15 @@ loadTriggerSetting();
 
 function handleInputForMention(e) {
   const target = e.target;
-  console.debug(
-    "[WebAiBridge] handleInputForMention called; target=",
-    target,
-    "lastFocusedInput=",
-    lastFocusedInput,
-  );
-  if (
-    !target ||
-    (!target.isContentEditable &&
-      target.tagName !== "TEXTAREA" &&
-      target.tagName !== "INPUT")
-  ) {
+  console.debug('[WebAiBridge] handleInputForMention called; target=', target, 'lastFocusedInput=', lastFocusedInput);
+  if (!target || (!target.isContentEditable && target.tagName !== 'TEXTAREA' && target.tagName !== 'INPUT')) {
     return;
   }
-
+  
   const site = detectSite();
   let text, cursorPos;
-
-  if ("value" in target && target.tagName !== "DIV") {
+  
+  if ('value' in target && target.tagName !== 'DIV') {
     text = target.value;
     cursorPos = target.selectionStart || 0;
   } else if (target.isContentEditable) {
@@ -2497,39 +2371,39 @@ function handleInputForMention(e) {
       cursorPos = range.startOffset;
     } else {
       // For ProseMirror (Claude) - try to get text from the element
-      const textContent = target.innerText || target.textContent || "";
+      const textContent = target.innerText || target.textContent || '';
       text = textContent;
       cursorPos = textContent.length; // Approximate - cursor at end
     }
   } else {
     return;
   }
-
+  
   const textBeforeCursor = text.slice(0, cursorPos);
-
+  
   // Build trigger pattern based on custom setting (default: @)
   let triggerMatch = null;
-  const triggerSetting = cachedTriggerChar || "@";
-
+  const triggerSetting = cachedTriggerChar || '@';
+  
   // Escape special regex characters in the trigger
-  const escapedTrigger = triggerSetting.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedTrigger = triggerSetting.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const triggerRegex = new RegExp(`${escapedTrigger}(\\w*)$`);
   triggerMatch = textBeforeCursor.match(triggerRegex);
-
+  
   if (triggerMatch) {
-    mentionQuery = triggerMatch[1] || "";
+    mentionQuery = triggerMatch[1] || '';
     mentionStartPos = cursorPos - triggerMatch[0].length;
-
+    
     // Save the trigger offset in the full text (more reliable than Range for rich editors)
     mentionTriggerOffset = mentionStartPos;
     mentionFullTextAtTrigger = text;
-
+    
     // Capture the current Range for later use during insertion
     const sel = window.getSelection();
     if (sel && sel.rangeCount > 0) {
       mentionRange = sel.getRangeAt(0).cloneRange();
     }
-
+    
     if (!mentionPopover) {
       createMentionPopover(target);
     } else {
@@ -2540,7 +2414,7 @@ function handleInputForMention(e) {
     // While in file-picker mode, keep the popover open and update the query
     if (!mentionPopover) createMentionPopover(target);
     const m = textBeforeCursor.match(/(\S+)$/);
-    mentionQuery = m ? m[1] : "";
+    mentionQuery = m ? m[1] : '';
     selectedMentionIndex = 0;
     updateMentionOptions();
   } else {
@@ -2549,132 +2423,83 @@ function handleInputForMention(e) {
 }
 
 // Listen for input events to detect @
-document.addEventListener("input", handleInputForMention, true);
+document.addEventListener('input', handleInputForMention, true);
 
 // Listen for input events to sync chips when text is edited/deleted
-document.addEventListener(
-  "input",
-  (e) => {
-    const target = e.target;
-    if (
-      target &&
-      (target.isContentEditable ||
-        target.tagName === "TEXTAREA" ||
-        target.tagName === "INPUT")
-    ) {
-      // Debounce the sync to avoid too frequent updates
-      clearTimeout(target._chipSyncTimeout);
-      target._chipSyncTimeout = setTimeout(() => {
-        syncChipsWithText(target);
-      }, 300);
-    }
-  },
-  true,
-);
+document.addEventListener('input', (e) => {
+  const target = e.target;
+  if (target && (target.isContentEditable || target.tagName === 'TEXTAREA' || target.tagName === 'INPUT')) {
+    // Debounce the sync to avoid too frequent updates
+    clearTimeout(target._chipSyncTimeout);
+    target._chipSyncTimeout = setTimeout(() => {
+      syncChipsWithText(target);
+    }, 300);
+  }
+}, true);
 
 // For Claude/ProseMirror: also listen to keyup as input events may not fire reliably
 // This provides a backup detection method
-document.addEventListener(
-  "keyup",
-  (e) => {
-    const site = detectSite();
-    if (site === "claude" && !mentionPopover) {
-      // Only trigger on potential mention characters
-      if (e.key === "@" || e.key === "#" || e.key.length === 1) {
-        // Small delay to let ProseMirror update
-        setTimeout(() => {
-          handleInputForMention({ target: e.target });
-        }, 10);
-      }
+document.addEventListener('keyup', (e) => {
+  const site = detectSite();
+  if (site === 'claude' && !mentionPopover) {
+    // Only trigger on potential mention characters
+    if (e.key === '@' || e.key === '#' || e.key.length === 1) {
+      // Small delay to let ProseMirror update
+      setTimeout(() => {
+        handleInputForMention({ target: e.target });
+      }, 10);
     }
-  },
-  true,
-);
+  }
+}, true);
 
 // General fallback: listen for keyup and compositionend globally to detect @/# triggers
 // Some editors (rich content editors) do not reliably emit input events for single characters.
-document.addEventListener(
-  "keyup",
-  (e) => {
-    if (mentionPopover) return; // already open
-    // Watch for typical trigger keys or any single printable character
-    if (
-      e.key === "@" ||
-      e.key === "#" ||
-      e.key === "/" ||
-      (e.key && e.key.length === 1)
-    ) {
-      setTimeout(() => {
-        try {
-          handleInputForMention({ target: e.target });
-        } catch (err) {
-          /* ignore */
-        }
-      }, 8);
-    }
-  },
-  true,
-);
-
-document.addEventListener(
-  "compositionend",
-  (e) => {
-    if (mentionPopover) return;
+document.addEventListener('keyup', (e) => {
+  if (mentionPopover) return; // already open
+  // Watch for typical trigger keys or any single printable character
+  if (e.key === '@' || e.key === '#' || e.key === '/' || (e.key && e.key.length === 1)) {
     setTimeout(() => {
-      try {
-        handleInputForMention({ target: e.target });
-      } catch (err) {
-        /* ignore */
-      }
+      try { handleInputForMention({ target: e.target }); } catch (err) { /* ignore */ }
     }, 8);
-  },
-  true,
-);
+  }
+}, true);
+
+document.addEventListener('compositionend', (e) => {
+  if (mentionPopover) return;
+  setTimeout(() => {
+    try { handleInputForMention({ target: e.target }); } catch (err) { /* ignore */ }
+  }, 8);
+}, true);
 
 // Manual debug shortcut: Ctrl+Shift+M opens the mention popover for the last focused input
-document.addEventListener(
-  "keydown",
-  (e) => {
-    if (e.ctrlKey && e.shiftKey && (e.key === "M" || e.key === "m")) {
-      const input = lastFocusedInput || findChatInput();
-      console.debug(
-        "[WebAiBridge] Manual popover trigger via Ctrl+Shift+M; input=",
-        input,
-      );
-      if (input) {
-        mentionQuery = "";
-        mentionStartPos = 0;
-        createMentionPopover(input);
-        e.preventDefault();
-      }
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.shiftKey && (e.key === 'M' || e.key === 'm')) {
+    const input = lastFocusedInput || findChatInput();
+    console.debug('[WebAiBridge] Manual popover trigger via Ctrl+Shift+M; input=', input);
+    if (input) {
+      mentionQuery = '';
+      mentionStartPos = 0;
+      createMentionPopover(input);
+      e.preventDefault();
     }
-  },
-  true,
-);
+  }
+}, true);
 
 // Listen for keydown to handle navigation
-document.addEventListener(
-  "keydown",
-  (e) => {
-    if (mentionPopover) {
-      if (handleMentionKeydown(e)) {
-        return;
-      }
+document.addEventListener('keydown', (e) => {
+  if (mentionPopover) {
+    if (handleMentionKeydown(e)) {
+      return;
     }
-  },
-  true,
-);
+  }
+}, true);
 
 // Close popover when clicking outside
-document.addEventListener(
-  "click",
-  (e) => {
-    if (mentionPopover && !mentionPopover.contains(e.target)) {
-      removeMentionPopover();
-    }
-  },
-  true,
-);
+document.addEventListener('click', (e) => {
+  if (mentionPopover && !mentionPopover.contains(e.target)) {
+    removeMentionPopover();
+  }
+}, true);
 
 // ==================== Submit Interceptor ====================
 // Intercept form submission to expand chips to their full content
@@ -2684,24 +2509,24 @@ let isExpandingChips = false; // Prevent recursive expansion
 // Find send button with shadow DOM awareness for Copilot
 function findSendButtonDeep() {
   const site = detectSite();
-
-  if (site === "copilot") {
+  
+  if (site === 'copilot') {
     // Stable testid when available
     let btn = querySelectorDeep('[data-testid*="composer-send-button"]');
     if (btn) return btn;
-
+    
     // ARIA-role buttons with localized labels (i18n-safe)
     const candidates = querySelectorAllDeep('button, [role="button"]');
-    const found = candidates.find((b) => {
-      const aria = (b.getAttribute("aria-label") || "").toLowerCase();
-      const testid = (b.getAttribute("data-testid") || "").toLowerCase();
-      return testid.includes("send") || aria.includes("send");
+    const found = candidates.find(b => {
+      const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+      const testid = (b.getAttribute('data-testid') || '').toLowerCase();
+      return testid.includes('send') || aria.includes('send');
     });
     if (found) return found;
-
+    
     return querySelectorDeep('button[type="submit"], button');
   }
-
+  
   // Standard DOM query for other sites
   const cfg = getSiteConfig(site);
   if (cfg?.sendButtonSelectors) {
@@ -2715,135 +2540,110 @@ function findSendButtonDeep() {
 
 function setupSubmitInterceptor() {
   const site = detectSite();
-  console.debug("[WebAiBridge] Setting up submit interceptor for site:", site);
-
+  console.debug('[WebAiBridge] Setting up submit interceptor for site:', site);
+  
   // Intercept Enter key to expand chips before submit
   // Using capture phase (true) to run before site's handlers
-  document.addEventListener(
-    "keydown",
-    (e) => {
-      // Skip if we're in the middle of expanding
-      if (isExpandingChips) return;
-
-      if (
-        e.key === "Enter" &&
-        !e.shiftKey &&
-        !e.isComposing &&
-        !mentionPopover
-      ) {
-        const input = findChatInput();
-        if (input && hasInlineChips(input)) {
-          console.debug("[WebAiBridge] Enter pressed with chips, expanding...");
-          isExpandingChips = true;
-
-          // Let the event continue BUT expand the chips first synchronously
-          expandChipsToContent(input);
-
-          // Small delay to ensure DOM updates before submit
-          setTimeout(() => {
-            isExpandingChips = false;
-          }, 200);
-
-          // Don't prevent default - just let the modified content submit
-        }
+  document.addEventListener('keydown', (e) => {
+    // Skip if we're in the middle of expanding
+    if (isExpandingChips) return;
+    
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !mentionPopover) {
+      const input = findChatInput();
+      if (input && hasInlineChips(input)) {
+        console.debug('[WebAiBridge] Enter pressed with chips, expanding...');
+        isExpandingChips = true;
+        
+        // Let the event continue BUT expand the chips first synchronously
+        expandChipsToContent(input);
+        
+        // Small delay to ensure DOM updates before submit
+        setTimeout(() => {
+          isExpandingChips = false;
+        }, 200);
+        
+        // Don't prevent default - just let the modified content submit
       }
-    },
-    true,
-  );
-
+    }
+  }, true);
+  
   // Also intercept click/pointer on send buttons using capture phase
   // Use pointerdown for better capture before click handlers
   const handleSendClick = (e) => {
     if (isExpandingChips) return;
-
+    
     const target = e.target;
-
+    
     // Check if this looks like a send button (more comprehensive)
-    const sendButton =
+    const sendButton = 
       target.closest('button[data-testid*="send"]') ||
       target.closest('button[data-testid*="Send"]') ||
       target.closest('button[aria-label*="Send"]') ||
       target.closest('button[aria-label*="send"]') ||
-      target.closest("button.send-button") ||
+      target.closest('button.send-button') ||
       target.closest('[data-testid="send-button"]') ||
       target.closest('[data-testid="composer-send-button"]') ||
       target.closest('button[type="submit"]') ||
-      (target.tagName === "BUTTON" &&
-        (target.querySelector('svg[data-icon="send"]') ||
-          target.textContent?.toLowerCase().includes("send"))) ||
-      target.closest("button")?.querySelector("svg"); // Many send buttons are just icon buttons
-
+      (target.tagName === 'BUTTON' && (
+        target.querySelector('svg[data-icon="send"]') ||
+        target.textContent?.toLowerCase().includes('send')
+      )) ||
+      target.closest('button')?.querySelector('svg'); // Many send buttons are just icon buttons
+    
     if (sendButton) {
       const input = findChatInput();
       if (input && hasInlineChips(input)) {
-        console.debug(
-          "[WebAiBridge] Send button clicked with chips, expanding first...",
-        );
+        console.debug('[WebAiBridge] Send button clicked with chips, expanding first...');
         isExpandingChips = true;
-
+        
         // Expand chips synchronously before click completes
         expandChipsToContent(input);
-
+        
         setTimeout(() => {
           isExpandingChips = false;
         }, 200);
-
+        
         // Let the click continue with expanded content
       }
     }
   };
-
+  
   // Use both pointerdown (for Copilot) and mousedown (fallback) in capture phase
-  document.addEventListener("pointerdown", handleSendClick, {
-    capture: true,
-    passive: true,
-  });
-  document.addEventListener("mousedown", handleSendClick, {
-    capture: true,
-    passive: true,
-  });
-
+  document.addEventListener('pointerdown', handleSendClick, { capture: true, passive: true });
+  document.addEventListener('mousedown', handleSendClick, { capture: true, passive: true });
+  
   // Watch for form submissions
-  document.addEventListener(
-    "submit",
-    (e) => {
-      if (isExpandingChips) return;
-
-      const input = findChatInput();
-      if (input && hasInlineChips(input)) {
-        console.debug("[WebAiBridge] Form submit with chips, expanding...");
-        isExpandingChips = true;
-        expandChipsToContent(input);
-        setTimeout(() => {
-          isExpandingChips = false;
-        }, 200);
-      }
-    },
-    true,
-  );
-
+  document.addEventListener('submit', (e) => {
+    if (isExpandingChips) return;
+    
+    const input = findChatInput();
+    if (input && hasInlineChips(input)) {
+      console.debug('[WebAiBridge] Form submit with chips, expanding...');
+      isExpandingChips = true;
+      expandChipsToContent(input);
+      setTimeout(() => {
+        isExpandingChips = false;
+      }, 200);
+    }
+  }, true);
+  
   // For Copilot: also observe DOM for remounts and re-hook
-  if (site === "copilot") {
+  if (site === 'copilot') {
     const remountObserver = new MutationObserver(() => {
       // Copilot SPA remounts the composer, ensure our hooks still work
       // The event listeners on document persist, but we may need to re-find elements
     });
-    remountObserver.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-    });
-
+    remountObserver.observe(document.documentElement, { childList: true, subtree: true });
+    
     // Handle SPA route changes
-    window.addEventListener("popstate", () => {
-      console.debug("[WebAiBridge] Route change detected, re-initializing...");
+    window.addEventListener('popstate', () => {
+      console.debug('[WebAiBridge] Route change detected, re-initializing...');
     });
-
-    if ("navigation" in window) {
+    
+    if ('navigation' in window) {
       try {
-        window.navigation.addEventListener("navigate", () => {
-          console.debug(
-            "[WebAiBridge] Navigation detected, re-initializing...",
-          );
+        window.navigation.addEventListener('navigate', () => {
+          console.debug('[WebAiBridge] Navigation detected, re-initializing...');
         });
       } catch (e) {}
     }
@@ -2855,29 +2655,24 @@ function setupSubmitInterceptor() {
  */
 function hasInlineChips(element) {
   if (!element) return false;
-
+  
   // Check if we have any tracked contexts
   if (insertedContexts.length === 0) {
-    console.debug("[WebAiBridge] hasInlineChips: no insertedContexts");
+    console.debug('[WebAiBridge] hasInlineChips: no insertedContexts');
     return false;
   }
-
+  
   // Get the text content
-  const text = element.isContentEditable
-    ? element.innerText || element.textContent || ""
-    : element.value || "";
-
+  const text = element.isContentEditable 
+    ? (element.innerText || element.textContent || '')
+    : (element.value || '');
+  
   // Check if any of our placeholders are in the text
-  const hasPlaceholders = insertedContexts.some((ctx) =>
-    text.includes(ctx.placeholder),
+  const hasPlaceholders = insertedContexts.some(ctx => 
+    text.includes(ctx.placeholder)
   );
-
-  console.debug(
-    "[WebAiBridge] hasInlineChips check:",
-    hasPlaceholders,
-    "contexts:",
-    insertedContexts.length,
-  );
+  
+  console.debug('[WebAiBridge] hasInlineChips check:', hasPlaceholders, 'contexts:', insertedContexts.length);
   return hasPlaceholders;
 }
 
@@ -2889,37 +2684,27 @@ setupSubmitInterceptor();
 function insertTextDirect(text) {
   // Try last focused input, then find chat input, then active element
   const target = lastFocusedInput || findChatInput() || document.activeElement;
-
-  if (
-    target &&
-    (target.tagName === "TEXTAREA" ||
-      target.tagName === "INPUT" ||
-      target.isContentEditable)
-  ) {
+  
+  if (target && (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT' || target.isContentEditable)) {
     try {
       target.focus();
-
-      if ("value" in target && target.tagName !== "DIV") {
+      
+      if ('value' in target && target.tagName !== 'DIV') {
         // Standard textarea/input
         const start = target.selectionStart || target.value.length;
         const end = target.selectionEnd || target.value.length;
         const val = target.value;
         target.value = val.slice(0, start) + text + val.slice(end);
         const pos = start + text.length;
-        try {
-          target.setSelectionRange(pos, pos);
-        } catch (e) {}
+        try { target.setSelectionRange(pos, pos); } catch (e) {}
         // Trigger input event so the site knows content changed
-        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.dispatchEvent(new Event('input', { bubbles: true }));
       } else if (target.isContentEditable) {
         // ContentEditable div (Gemini, Claude, etc.)
         insertIntoContentEditable(target, text);
       }
       return true;
-    } catch (e) {
-      console.debug("insertTextDirect failed", e);
-      return false;
-    }
+    } catch (e) { console.debug('insertTextDirect failed', e); return false; }
   }
   return false;
 }
@@ -2930,19 +2715,11 @@ function insertIntoContentEditable(element, text) {
 
   // Try the simplest path first
   try {
-    const success = document.execCommand("insertText", false, text);
+    const success = document.execCommand('insertText', false, text);
     if (success) {
-      element.dispatchEvent(new Event("input", { bubbles: true }));
-      element.dispatchEvent(new Event("change", { bubbles: true }));
-      try {
-        element.dispatchEvent(
-          new InputEvent("textInput", {
-            bubbles: true,
-            cancelable: true,
-            data: text,
-          }),
-        );
-      } catch {}
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      try { element.dispatchEvent(new InputEvent('textInput', { bubbles: true, cancelable: true, data: text })); } catch {}
       return true;
     }
   } catch (e) {
@@ -2963,29 +2740,21 @@ function insertIntoContentEditable(element, text) {
       selection.removeAllRanges();
       selection.addRange(range);
 
-      element.dispatchEvent(new Event("input", { bubbles: true }));
-      element.dispatchEvent(new Event("change", { bubbles: true }));
-      try {
-        element.dispatchEvent(
-          new InputEvent("textInput", {
-            bubbles: true,
-            cancelable: true,
-            data: text,
-          }),
-        );
-      } catch {}
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      try { element.dispatchEvent(new InputEvent('textInput', { bubbles: true, cancelable: true, data: text })); } catch {}
       return true;
     } catch (e) {
-      console.debug("[WebAiBridge] Range insertion failed", e);
+      console.debug('[WebAiBridge] Range insertion failed', e);
     }
   }
 
   // Quill fallback: if element inside a Quill container
   try {
-    const quill = element.closest && element.closest(".ql-container")?.__quill;
+    const quill = element.closest && element.closest('.ql-container')?.__quill;
     if (quill) {
       quill.insertText(quill.getLength() - 1, text);
-      element.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event('input', { bubbles: true }));
       return true;
     }
   } catch (e) {
@@ -3002,32 +2771,19 @@ function insertIntoContentEditable(element, text) {
     const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
-    element.dispatchEvent(new Event("input", { bubbles: true }));
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-    try {
-      element.dispatchEvent(
-        new InputEvent("textInput", {
-          bubbles: true,
-          cancelable: true,
-          data: text,
-        }),
-      );
-    } catch {}
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+    try { element.dispatchEvent(new InputEvent('textInput', { bubbles: true, cancelable: true, data: text })); } catch {}
     return true;
   } catch (e) {
-    console.error(
-      "[WebAiBridge] insertIntoContentEditable final fallback failed",
-      e,
-    );
-    try {
-      showNotification("Failed to insert text into editor", "error");
-    } catch {}
+    console.error('[WebAiBridge] insertIntoContentEditable final fallback failed', e);
+    try { showNotification('Failed to insert text into editor', 'error'); } catch {}
     return false;
   }
 }
 
 function removeOverlay() {
-  const existing = document.getElementById("webaibridge-overlay");
+  const existing = document.getElementById('webaibridge-overlay');
   if (existing) existing.remove();
 }
 
@@ -3039,51 +2795,33 @@ function removeOverlay() {
 function findResponseElements() {
   const site = detectSite();
   let responses = [];
-
+  
   switch (site) {
-    case "gemini":
+    case 'gemini':
       // Gemini responses are in message-content divs
-      responses = Array.from(
-        document.querySelectorAll(
-          '.model-response-text, .response-content, [data-message-author-role="model"]',
-        ),
-      );
+      responses = Array.from(document.querySelectorAll('.model-response-text, .response-content, [data-message-author-role="model"]'));
       break;
-
-    case "chatgpt":
+      
+    case 'chatgpt':
       // ChatGPT responses have data-message-author-role="assistant"
-      responses = Array.from(
-        document.querySelectorAll(
-          '[data-message-author-role="assistant"] .markdown, .agent-turn .markdown',
-        ),
-      );
+      responses = Array.from(document.querySelectorAll('[data-message-author-role="assistant"] .markdown, .agent-turn .markdown'));
       break;
-
-    case "claude":
+      
+    case 'claude':
       // Claude responses
-      responses = Array.from(
-        document.querySelectorAll(
-          '[data-is-streaming="false"].font-claude-message, .prose',
-        ),
-      );
+      responses = Array.from(document.querySelectorAll('[data-is-streaming="false"].font-claude-message, .prose'));
       break;
-
-    case "copilot":
+      
+    case 'copilot':
       // Microsoft 365 Copilot responses - look for the main response containers
       // Based on DOM: divs with role="group" containing the response, or message turn containers
-      responses = Array.from(
-        document.querySelectorAll(
-          '[data-content="ai-message"], [class*="fui-FluentProvider"]',
-        ),
-      );
-
+      responses = Array.from(document.querySelectorAll('[data-content="ai-message"], [class*="fui-FluentProvider"]'));
+      
       // Try to find the parent message containers that hold the full response
       if (responses.length === 0) {
         // Look for containers that have code previews or substantial content
-        const codeContainers = document.querySelectorAll(
-          '[role="group"][aria-label*="Code"], [aria-label*="code"]',
-        );
-        codeContainers.forEach((cc) => {
+        const codeContainers = document.querySelectorAll('[role="group"][aria-label*="Code"], [aria-label*="code"]');
+        codeContainers.forEach(cc => {
           // Get the parent message container
           let parent = cc.parentElement;
           for (let i = 0; i < 5 && parent; i++) {
@@ -3095,33 +2833,25 @@ function findResponseElements() {
           }
         });
       }
-
+      
       // Fallback: find substantial text blocks that look like AI responses
       if (responses.length === 0) {
-        const allDivs = document.querySelectorAll("div");
-        responses = Array.from(allDivs)
-          .filter((el) => {
-            const text = el.textContent || "";
-            const hasSubstantialText = text.length > 100 && text.length < 10000;
-            const hasNoInput = !el.querySelector("textarea, input");
-            const hasCodeOrList = el.querySelector(
-              'pre, code, ul, ol, [role="group"]',
-            );
-            return hasSubstantialText && hasNoInput && hasCodeOrList;
-          })
-          .slice(0, 10); // Limit to avoid too many
+        const allDivs = document.querySelectorAll('div');
+        responses = Array.from(allDivs).filter(el => {
+          const text = el.textContent || '';
+          const hasSubstantialText = text.length > 100 && text.length < 10000;
+          const hasNoInput = !el.querySelector('textarea, input');
+          const hasCodeOrList = el.querySelector('pre, code, ul, ol, [role="group"]');
+          return hasSubstantialText && hasNoInput && hasCodeOrList;
+        }).slice(0, 10); // Limit to avoid too many
       }
       break;
-
+      
     default:
       // Generic: look for common response patterns
-      responses = Array.from(
-        document.querySelectorAll(
-          '.response, .message, .answer, [role="assistant"]',
-        ),
-      );
+      responses = Array.from(document.querySelectorAll('.response, .message, .answer, [role="assistant"]'));
   }
-
+  
   return responses;
 }
 
@@ -3129,156 +2859,138 @@ function findResponseElements() {
 function extractResponseText(element) {
   // Clone to avoid modifying the original
   const clone = element.cloneNode(true);
-
+  
   // Find code blocks and mark them
-  const codeBlocks = clone.querySelectorAll("pre code, pre, code");
+  const codeBlocks = clone.querySelectorAll('pre code, pre, code');
   codeBlocks.forEach((code, i) => {
-    const lang = code.className?.match(/language-(\w+)/)?.[1] || "";
+    const lang = code.className?.match(/language-(\w+)/)?.[1] || '';
     const text = code.textContent;
     code.textContent = `\n\`\`\`${lang}\n${text}\n\`\`\`\n`;
   });
-
-  return clone.textContent?.trim() || "";
+  
+  return clone.textContent?.trim() || '';
 }
 
 // Add "Send to VS Code" button to response elements
 function addSendButtons() {
   const responses = findResponseElements();
-
+  
   responses.forEach((response, index) => {
     // Skip if already has button
-    if (response.querySelector(".webaibridge-send-btn")) return;
-
+    if (response.querySelector('.webaibridge-send-btn')) return;
+    
     // Create button container
-    const btnContainer = document.createElement("div");
-    btnContainer.className = "webaibridge-btn-container";
-    btnContainer.style.cssText =
-      "display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid #eee;";
-
+    const btnContainer = document.createElement('div');
+    btnContainer.className = 'webaibridge-btn-container';
+    btnContainer.style.cssText = 'display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid #eee;';
+    
     // Send to VS Code button
-    const sendBtn = document.createElement("button");
-    sendBtn.className = "webaibridge-send-btn";
-    sendBtn.textContent = "📤 Send to VS Code";
-    sendBtn.style.cssText =
-      "padding:4px 10px;font-size:12px;cursor:pointer;background:#007bff;color:#fff;border:none;border-radius:4px;";
-    sendBtn.addEventListener("click", () => {
+    const sendBtn = document.createElement('button');
+    sendBtn.className = 'webaibridge-send-btn';
+    sendBtn.textContent = '📤 Send to VS Code';
+    sendBtn.style.cssText = 'padding:4px 10px;font-size:12px;cursor:pointer;background:#007bff;color:#fff;border:none;border-radius:4px;';
+    sendBtn.addEventListener('click', () => {
       const text = extractResponseText(response);
-      chrome.runtime.sendMessage(
-        {
-          type: "SEND_TO_VSCODE",
-          text,
-          responseIndex: index,
-          site: detectSite(),
-        },
-        (resp) => {
-          if (resp?.ok) {
-            sendBtn.textContent = "✓ Sent!";
-            sendBtn.style.background = "#28a745";
-            setTimeout(() => {
-              sendBtn.textContent = "📤 Send to VS Code";
-              sendBtn.style.background = "#007bff";
-            }, 2000);
-          }
-        },
-      );
+      chrome.runtime.sendMessage({ 
+        type: 'SEND_TO_VSCODE', 
+        text,
+        responseIndex: index,
+        site: detectSite()
+      }, (resp) => {
+        if (resp?.ok) {
+          sendBtn.textContent = '✓ Sent!';
+          sendBtn.style.background = '#28a745';
+          setTimeout(() => {
+            sendBtn.textContent = '📤 Send to VS Code';
+            sendBtn.style.background = '#007bff';
+          }, 2000);
+        }
+      });
     });
-
+    
     // Copy code blocks button
-    const copyCodeBtn = document.createElement("button");
-    copyCodeBtn.className = "webaibridge-copy-code-btn";
-    copyCodeBtn.textContent = "📋 Code to VS Code";
-    copyCodeBtn.style.cssText =
-      "padding:4px 10px;font-size:12px;cursor:pointer;background:#6c757d;color:#fff;border:none;border-radius:4px;";
-    copyCodeBtn.addEventListener("click", () => {
+    const copyCodeBtn = document.createElement('button');
+    copyCodeBtn.className = 'webaibridge-copy-code-btn';
+    copyCodeBtn.textContent = '📋 Code to VS Code';
+    copyCodeBtn.style.cssText = 'padding:4px 10px;font-size:12px;cursor:pointer;background:#6c757d;color:#fff;border:none;border-radius:4px;';
+    copyCodeBtn.addEventListener('click', () => {
       // Try multiple selectors for code blocks across different sites
       const codeSelectors = [
-        '[role="group"][aria-label*="Code"]', // Copilot code preview
-        '[role="group"][aria-label*="code"]', // Copilot code preview (lowercase)
-        '[class*="odeBlock"]', // Copilot CodeBlock class
-        '[class*="CodeBlock"]', // CodeBlock variations
-        "pre code", // Standard markdown
-        "pre", // Plain pre blocks
-        '[class*="code-block"]', // Common code block class
-        '[class*="codeBlock"]', // CamelCase variant
-        ".hljs", // Highlight.js
-        "code", // Inline code (will filter by length)
+        '[role="group"][aria-label*="Code"]',  // Copilot code preview
+        '[role="group"][aria-label*="code"]',  // Copilot code preview (lowercase)
+        '[class*="odeBlock"]',                 // Copilot CodeBlock class
+        '[class*="CodeBlock"]',                // CodeBlock variations
+        'pre code',                            // Standard markdown
+        'pre',                                 // Plain pre blocks
+        '[class*="code-block"]',               // Common code block class
+        '[class*="codeBlock"]',                // CamelCase variant
+        '.hljs',                               // Highlight.js
+        'code',                                // Inline code (will filter by length)
       ];
-
+      
       let codeBlocks = [];
       for (const selector of codeSelectors) {
         try {
           const found = response.querySelectorAll(selector);
           if (found.length > 0) {
             codeBlocks = Array.from(found);
-            console.debug(
-              "WebAiBridge: Found code with selector:",
-              selector,
-              codeBlocks.length,
-            );
+            console.debug('WebAiBridge: Found code with selector:', selector, codeBlocks.length);
             break;
           }
         } catch (e) {
-          console.debug("WebAiBridge: Invalid selector:", selector);
+          console.debug('WebAiBridge: Invalid selector:', selector);
         }
       }
-
+      
       // If still nothing, try to find the code content inside Copilot's structure
       if (codeBlocks.length === 0) {
         // Copilot puts code inside divs with dir="ltr" inside the code preview group
-        const copilotCode = response.querySelectorAll(
-          '[role="group"] div[dir="ltr"]',
-        );
+        const copilotCode = response.querySelectorAll('[role="group"] div[dir="ltr"]');
         if (copilotCode.length > 0) {
           codeBlocks = Array.from(copilotCode);
-          console.debug(
-            "WebAiBridge: Found Copilot code divs:",
-            codeBlocks.length,
-          );
+          console.debug('WebAiBridge: Found Copilot code divs:', codeBlocks.length);
         }
       }
-
+      
       // Filter to meaningful code blocks (longer than 20 chars, not just inline snippets)
       const codeTexts = codeBlocks
-        .map((c) => c.textContent?.trim())
-        .filter((text) => text && text.length > 20);
-
+        .map(c => c.textContent?.trim())
+        .filter(text => text && text.length > 20);
+      
       // Remove duplicates (pre might contain code, leading to duplicate content)
       const uniqueCode = [...new Set(codeTexts)];
-      const combinedCode = uniqueCode.join("\n\n---\n\n");
-
+      const combinedCode = uniqueCode.join('\n\n---\n\n');
+      
       if (combinedCode) {
-        chrome.runtime.sendMessage(
-          {
-            type: "SEND_TO_VSCODE",
-            text: combinedCode,
-            isCode: true,
-            responseIndex: index,
-            site: detectSite(),
-          },
-          (resp) => {
-            if (resp?.ok) {
-              copyCodeBtn.textContent = "✓ Sent!";
-              copyCodeBtn.style.background = "#28a745";
-              setTimeout(() => {
-                copyCodeBtn.textContent = "📋 Code to VS Code";
-                copyCodeBtn.style.background = "#6c757d";
-              }, 2000);
-            }
-          },
-        );
+        chrome.runtime.sendMessage({ 
+          type: 'SEND_TO_VSCODE', 
+          text: combinedCode,
+          isCode: true,
+          responseIndex: index,
+          site: detectSite()
+        }, (resp) => {
+          if (resp?.ok) {
+            copyCodeBtn.textContent = '✓ Sent!';
+            copyCodeBtn.style.background = '#28a745';
+            setTimeout(() => {
+              copyCodeBtn.textContent = '📋 Code to VS Code';
+              copyCodeBtn.style.background = '#6c757d';
+            }, 2000);
+          }
+        });
       } else {
-        copyCodeBtn.textContent = "No code found";
-        copyCodeBtn.style.background = "#dc3545";
+        copyCodeBtn.textContent = 'No code found';
+        copyCodeBtn.style.background = '#dc3545';
         setTimeout(() => {
-          copyCodeBtn.textContent = "📋 Code to VS Code";
-          copyCodeBtn.style.background = "#6c757d";
+          copyCodeBtn.textContent = '📋 Code to VS Code';
+          copyCodeBtn.style.background = '#6c757d';
         }, 2000);
       }
     });
-
+    
     btnContainer.appendChild(sendBtn);
     btnContainer.appendChild(copyCodeBtn);
-
+    
     // Insert at end of response
     response.appendChild(btnContainer);
   });
@@ -3287,21 +2999,21 @@ function addSendButtons() {
 // Watch for new responses and add buttons
 function setupResponseObserver() {
   const site = detectSite();
-  if (site === "unknown") return;
-
+  if (site === 'unknown') return;
+  
   // Add buttons to existing responses
   setTimeout(addSendButtons, 1000);
-
+  
   // Watch for new responses
   const observer = new MutationObserver((mutations) => {
     // Debounce
     clearTimeout(observer.timeout);
     observer.timeout = setTimeout(addSendButtons, 500);
   });
-
+  
   observer.observe(document.body, {
     childList: true,
-    subtree: true,
+    subtree: true
   });
 }
 
@@ -3309,44 +3021,38 @@ function setupResponseObserver() {
 setupResponseObserver();
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.type === "INSERT_TEXT") {
-    const text = msg.text || "";
+  if (msg?.type === 'INSERT_TEXT') {
+    const text = msg.text || '';
     const auto = !!msg.auto;
-    const model = msg.model || "gpt-4";
-
+    const model = msg.model || 'gpt-4';
+    
     // Apply limit mode handling
-    applyLimitMode(text).then((limitResult) => {
-      console.debug("INSERT_TEXT limit result:", limitResult);
-
+    applyLimitMode(text).then(limitResult => {
+      console.debug('INSERT_TEXT limit result:', limitResult);
+      
       switch (limitResult.action) {
-        case "insert":
+        case 'insert':
           // Direct insert (possibly truncated)
           if (auto) {
             const ok = insertTextDirect(limitResult.text);
             if (!ok) {
               createOverlay(limitResult.text, model);
             } else if (limitResult.wasTruncated) {
-              showNotification(
-                `Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`,
-                "warning",
-              );
+              showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
             }
           } else {
             createOverlay(limitResult.text, model);
             if (limitResult.wasTruncated) {
-              showNotification(
-                `Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`,
-                "warning",
-              );
+              showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
             }
           }
           break;
-
-        case "warn":
+          
+        case 'warn':
           // Show warning dialog
           const inputElement = lastFocusedInput || findChatInput();
           showLimitWarning(
-            limitResult.tokens,
+            limitResult.tokens, 
             limitResult.limit,
             () => {
               if (auto && inputElement) {
@@ -3362,25 +3068,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               }
             },
             () => {
-              console.debug("User cancelled chip insertion");
-            },
+              console.debug('User cancelled chip insertion');
+            }
           );
           break;
-
-        case "chunk":
+          
+        case 'chunk':
           // Show chunk navigator
           const chunkInput = lastFocusedInput || findChatInput();
           showChunkNavigator(limitResult.chunks, chunkInput);
           break;
       }
     });
-
+    
     sendResponse({ ok: true });
     return true;
   }
 });
 
-window.addEventListener("beforeunload", removeOverlay);
+window.addEventListener('beforeunload', removeOverlay);
 
 // ==================== Input Clear Detection ====================
 // Uses MutationObserver for better performance and reliability
@@ -3395,56 +3101,50 @@ function setupInputClearDetection() {
     setTimeout(setupInputClearDetection, 1000);
     return;
   }
-
+  
   // Clean up previous observer
   if (inputClearObserver) {
     inputClearObserver.disconnect();
   }
-
+  
   // For contenteditable elements, observe mutations
   if (input.isContentEditable) {
     inputClearObserver = new MutationObserver((mutations) => {
-      const currentLength = (input.innerText || input.textContent || "").trim()
-        .length;
-
+      const currentLength = (input.innerText || input.textContent || '').trim().length;
+      
       // If input went from having content to nearly empty, clear chips
       if (lastKnownInputLength > 50 && currentLength < 10) {
-        console.debug(
-          "[WebAiBridge] Input cleared (mutation), clearing context chips",
-        );
+        console.debug('[WebAiBridge] Input cleared (mutation), clearing context chips');
         clearAllContextChips();
       }
-
+      
       lastKnownInputLength = currentLength;
     });
-
+    
     inputClearObserver.observe(input, {
       childList: true,
       subtree: true,
-      characterData: true,
+      characterData: true
     });
-
-    lastKnownInputLength = (input.innerText || input.textContent || "").trim()
-      .length;
+    
+    lastKnownInputLength = (input.innerText || input.textContent || '').trim().length;
   } else {
     // For textarea/input, listen to input events
-    input.addEventListener("input", () => {
+    input.addEventListener('input', () => {
       const currentLength = input.value.length;
-
+      
       if (lastKnownInputLength > 50 && currentLength < 10) {
-        console.debug(
-          "[WebAiBridge] Input cleared (event), clearing context chips",
-        );
+        console.debug('[WebAiBridge] Input cleared (event), clearing context chips');
         clearAllContextChips();
       }
-
+      
       lastKnownInputLength = currentLength;
     });
-
+    
     lastKnownInputLength = input.value.length;
   }
-
-  console.debug("[WebAiBridge] Input clear detection set up");
+  
+  console.debug('[WebAiBridge] Input clear detection set up');
 }
 
 // Also watch for "Stop Generating" button appearing/disappearing as a signal
@@ -3452,26 +3152,22 @@ function setupGenerationCompleteDetection() {
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       // Removed nodes: stop button removed indicates generation finished
-      if (mutation.type === "childList") {
+      if (mutation.type === 'childList') {
         for (const node of mutation.removedNodes) {
           if (node.nodeType === Node.ELEMENT_NODE) {
             const el = node;
             // Various selectors for stop/generating buttons across sites
-            if (
-              el.matches?.('[aria-label*="Stop"]') ||
-              el.matches?.('[data-testid*="stop"]') ||
-              el.textContent?.includes("Stop generating") ||
-              el.textContent?.includes("Regenerate")
-            ) {
-              console.debug(
-                "[WebAiBridge] Generation complete detected (removed node), checking for clear",
-              );
+            if (el.matches?.('[aria-label*="Stop"]') ||
+                el.matches?.('[data-testid*="stop"]') ||
+                el.textContent?.includes('Stop generating') ||
+                el.textContent?.includes('Regenerate')) {
+              console.debug('[WebAiBridge] Generation complete detected (removed node), checking for clear');
               // Small delay to let the UI update
               setTimeout(() => {
                 const input = findChatInput();
                 if (input) {
-                  const length = input.isContentEditable
-                    ? (input.innerText || input.textContent || "").trim().length
+                  const length = input.isContentEditable 
+                    ? (input.innerText || input.textContent || '').trim().length
                     : input.value?.length || 0;
                   if (length < 10) {
                     clearAllContextChips();
@@ -3484,30 +3180,21 @@ function setupGenerationCompleteDetection() {
       }
 
       // Attribute changes: some sites change aria-label/class from "Stop" → "Regenerate" etc.
-      if (
-        mutation.type === "attributes" &&
-        mutation.target &&
-        mutation.target.nodeType === Node.ELEMENT_NODE
-      ) {
+      if (mutation.type === 'attributes' && mutation.target && mutation.target.nodeType === Node.ELEMENT_NODE) {
         const t = mutation.target;
-        const aria = t.getAttribute && t.getAttribute("aria-label");
-        const dataTest = t.getAttribute && t.getAttribute("data-testid");
-        const text = t.textContent || "";
+        const aria = t.getAttribute && t.getAttribute('aria-label');
+        const dataTest = t.getAttribute && t.getAttribute('data-testid');
+        const text = t.textContent || '';
 
-        if (
-          (aria && /Stop|Regenerate|Generating/i.test(aria)) ||
-          (dataTest && /stop|regenerate/i.test(dataTest)) ||
-          /Stop generating|Regenerate/i.test(text)
-        ) {
-          console.debug(
-            "[WebAiBridge] Generation complete detected (attribute change), checking for clear",
-            { aria, dataTest, textSnippet: text.slice(0, 80) },
-          );
+        if ((aria && /Stop|Regenerate|Generating/i.test(aria)) ||
+            (dataTest && /stop|regenerate/i.test(dataTest)) ||
+            /Stop generating|Regenerate/i.test(text)) {
+          console.debug('[WebAiBridge] Generation complete detected (attribute change), checking for clear', { aria, dataTest, textSnippet: text.slice(0,80) });
           setTimeout(() => {
             const input = findChatInput();
             if (input) {
-              const length = input.isContentEditable
-                ? (input.innerText || input.textContent || "").trim().length
+              const length = input.isContentEditable 
+                ? (input.innerText || input.textContent || '').trim().length
                 : input.value?.length || 0;
               if (length < 10) {
                 clearAllContextChips();
@@ -3524,7 +3211,7 @@ function setupGenerationCompleteDetection() {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ["aria-label", "data-testid", "class"],
+    attributeFilter: ['aria-label', 'data-testid', 'class']
   });
 }
 
