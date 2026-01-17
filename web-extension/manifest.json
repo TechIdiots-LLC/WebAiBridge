@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WebAiBridge",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Bridge VS Code context to AI chat sites like ChatGPT, Claude, Gemini, and more",
   "permissions": [
     "scripting",
