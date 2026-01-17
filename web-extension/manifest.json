@@ -1,10 +1,17 @@
 {
   "manifest_version": 3,
   "name": "WebAiBridge",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Bridge VS Code context to AI chat sites like ChatGPT, Claude, Gemini, and more",
-  "permissions": ["scripting","activeTab","storage","tabs"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "action": {
     "default_popup": "src/popup.html",
     "default_title": "WebAiBridge"
@@ -14,8 +21,13 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["src/tokenizer.js", "src/content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/tokenizer.js",
+        "src/content.js"
+      ],
       "run_at": "document_start"
     }
   ]

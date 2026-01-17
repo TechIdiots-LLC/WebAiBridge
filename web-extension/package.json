@@ -1,6 +1,6 @@
-﻿{
+{
   "name": "webaibridge-chrome",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "license": "BSD-2-Clause",
   "description": "Chrome extension for WebAiBridge",
   "scripts": {
@@ -11,8 +11,7 @@
   },
   "dependencies": {
     "tiktoken": "^1.0.10"
-  }
-  ,
+  },
   "devDependencies": {
     "prettier": "^3.8.0",
     "eslint": "^9.39.2"
