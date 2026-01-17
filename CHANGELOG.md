@@ -9,6 +9,5 @@
 
 ## 0.6.1
 ### ✨ Features and improvements
-
-### 🐞 Bug fixes
+- Workflow improvements
 
