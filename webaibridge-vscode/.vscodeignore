@@ -9,10 +9,8 @@ vsc-extension-quickstart.md
 **/*.map
 **/*.ts
 **/.vscode-test.*
-**/node_modules/**
-../*
-../**
 .git
 .git/**
 .github
 .github/**
+
