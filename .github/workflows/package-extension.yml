@@ -37,9 +37,13 @@ jobs:
       - name: Install vsce
         run: npm install -g @vscode/vsce
 
-      - name: Package VS Code extension
-        working-directory: webaibridge-vscode
-        run: vsce package
+      - name: Package VS Code extension (isolated)
+        run: |
+          tmpdir=$(mktemp -d)
+          (cd webaibridge-vscode && tar -cf - .) | (cd "$tmpdir" && tar -xf -)
+          cd "$tmpdir"
+          vsce package
+          mv *.vsix "$GITHUB_WORKSPACE/webaibridge-vscode/" || true
 
       # Build Chrome Extension
       - name: Create Chrome extension zip
@@ -87,9 +91,13 @@ jobs:
       - name: Install vsce
         run: npm install -g @vscode/vsce
 
-      - name: Package VS Code extension
-        working-directory: webaibridge-vscode
-        run: vsce package
+      - name: Package VS Code extension (isolated)
+        run: |
+          tmpdir=$(mktemp -d)
+          (cd webaibridge-vscode && tar -cf - .) | (cd "$tmpdir" && tar -xf -)
+          cd "$tmpdir"
+          vsce package
+          mv *.vsix "$GITHUB_WORKSPACE/webaibridge-vscode/" || true
 
       # Build Chrome Extension
       - name: Create Chrome extension zip
