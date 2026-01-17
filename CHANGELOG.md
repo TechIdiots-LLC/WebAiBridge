@@ -7,3 +7,7 @@
 ### 🐞 Bug fixes
 - _...Add new stuff here..._
 
+## 0.6.1
+### ✨ Features and improvements
+- Workflow improvements
+
