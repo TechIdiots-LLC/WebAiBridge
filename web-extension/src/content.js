@@ -2227,69 +2227,18 @@ function showErrorNotification(message) {
 }
 
 function removeAtQueryFromElement(element, startPos, query) {
+  // Option 3: Do NOT remove the chip text/trigger from the edit box
+  // This allows the user to click it again if needed, or see what was added.
+  // The original implementation removed the @trigger text.
+  // We will simply return here to implement "maybe they should stay there so they could be readded"
+  return; 
+
+  /* Original implementation commented out for Feature #3
   if (startPos === -1) return;
   
   const site = detectSite();
-  
-  try {
-    if ('value' in element && element.tagName !== 'DIV') {
-      const val = element.value;
-      // Calculate trigger length based on site
-      let triggerLen = 1; // Default for @ or #
-      if (site === 'copilot') {
-        // Check if it was // or /wab trigger
-        const before = val.slice(0, startPos + query.length + 5);
-        if (before.match(/\/wab\s*$/i)) {
-          triggerLen = 4; // /wab
-        } else {
-          triggerLen = 2; // //
-        }
-      }
-      const queryLen = query.length + triggerLen;
-      const before = val.slice(0, startPos);
-      const after = val.slice(startPos + queryLen);
-      element.value = before + after;
-      element.setSelectionRange(startPos, startPos);
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-    } else if (element.isContentEditable) {
-      // For contenteditable, we need to find and remove the trigger+query
-      const sel = window.getSelection();
-      if (sel && sel.rangeCount > 0) {
-        const range = sel.getRangeAt(0);
-        const container = range.startContainer;
-        if (container.nodeType === Node.TEXT_NODE) {
-          const text = container.textContent;
-          // Find the trigger character(s) before cursor
-          let triggerIdx = -1;
-          if (site === 'copilot') {
-            // Look for // or /wab
-            const slashIdx = text.lastIndexOf('//', range.startOffset);
-            const wabIdx = text.toLowerCase().lastIndexOf('/wab', range.startOffset);
-            triggerIdx = Math.max(slashIdx, wabIdx);
-          } else {
-            // Look for @ or #
-            const atIdx = text.lastIndexOf('@', range.startOffset);
-            const hashIdx = text.lastIndexOf('#', range.startOffset);
-            triggerIdx = Math.max(atIdx, hashIdx);
-          }
-          
-          if (triggerIdx >= 0) {
-            const newText = text.slice(0, triggerIdx) + text.slice(range.startOffset);
-            container.textContent = newText;
-            // Set cursor position
-            const newRange = document.createRange();
-            newRange.setStart(container, Math.min(triggerIdx, newText.length));
-            newRange.collapse(true);
-            sel.removeAllRanges();
-            sel.addRange(newRange);
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.debug('removeAtQueryFromElement failed', e);
-  }
+  // ... (rest of original deletion logic)
+  */
 }
 
 function requestContextInfo() {
