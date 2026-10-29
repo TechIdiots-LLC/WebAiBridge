@@ -18,13 +18,13 @@ jobs:
           node-version: '20'
 
       - name: Install & build VSCode extension
-        working-directory: vscode-extension
+        working-directory: webaibridge-vscode
         run: |
           npm ci
           npm run compile
 
       - name: Typecheck VSCode extension
-        working-directory: vscode-extension
+        working-directory: webaibridge-vscode
         run: |
           npx tsc -p ./tsconfig.json --noEmit
 
