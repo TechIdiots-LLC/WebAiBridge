@@ -298,6 +298,27 @@ document.getElementById("triggerChar")?.addEventListener("input", (e) => {
   });
 });
 
+// Allowed Sites logic
+document.getElementById('saveAllowedSites')?.addEventListener('click', () => {
+  const text = document.getElementById('allowedSites').value;
+  const sites = text.split('\n').map(s => s.trim()).filter(Boolean);
+  chrome.storage.local.set({ allowedSites: sites }, () => {
+    const btn = document.getElementById('saveAllowedSites');
+    const originalText = btn.textContent;
+    btn.textContent = 'Saved!';
+    setTimeout(() => { btn.textContent = originalText; }, 1500);
+  });
+});
+
+function loadAllowedSites() {
+  chrome.storage.local.get(['allowedSites'], (res) => {
+    const textarea = document.getElementById('allowedSites');
+    if (textarea && res.allowedSites) {
+      textarea.value = res.allowedSites.join('\n');
+    }
+  });
+}
+
 // Initial load
 updateBridgeStatus();
 updateInstances();
@@ -305,6 +326,7 @@ updateChips();
 updateStats();
 loadLimitSettings();
 loadTriggerSetting();
+loadAllowedSites();
 
 // Periodic refresh
 setInterval(() => {

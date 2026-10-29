@@ -2371,6 +2371,55 @@ function handleInputForMention(e) {
     return;
   }
   
+  // Check allowed sites before showing anything
+  chrome.storage.local.get(['allowedSites'], (res) => {
+    const allowed = res.allowedSites || [];
+    const host = location.hostname;
+    
+    // Always allowed on known configured sites unless overridden? 
+    // The requirement says "restrict the pages that can show up on... possibly with a combination of built in pages, and/or editable list"
+    
+    // Check if current site matches any pattern
+    // Default patterns if list is empty or matches known sites
+    const isKnownSite = detectSite() !== 'unknown';
+    
+    let isAllowed = false;
+    
+    if (allowed.length === 0) {
+      // If no custom allowed sites, allow on known sites
+      isAllowed = isKnownSite;
+    } else {
+      // Check glob patterns
+      isAllowed = allowed.some(pattern => {
+        // Simple glob matching: * matches anything
+        const regex = new RegExp('^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
+        return regex.test(host);
+      });
+      
+      // Also allow if it is a known site and user hasn't explicitly excluded (unless "allowedSites" is a specific allowlist)
+      // Usually "Allowed Sites" implies an allowlist. So if the list exists, ONLY those sites are allowed.
+      // But maybe we want to include default sites too?
+      // "maybe we should restrict the pages ... possibly with a combination of default built in pages, and/or an editable list"
+      // So let's include known sites by default if they aren't explicitly blocked? 
+      // Simplified: If allowed list has entries, check it. If also known site, allow it? 
+      // Let's treat the list as ADDITIONAL sites or overrides.
+      // Wait, "restrict the pages" implies they are seeing it where they don't want it.
+      // So if the list is present, we should probably ONLY allow what's in the list OR the default supported sites.
+      // Actually, if they are seeing it on "any page", it means our content script is running everywhere.
+      
+      if (!isAllowed && isKnownSite) {
+         isAllowed = true; 
+      }
+    }
+
+    if (!isAllowed) return;
+
+    // ... continue with logic inside the callback
+    processInputForMention(target);
+  });
+}
+
+function processInputForMention(target) {
   const site = detectSite();
   let text, cursorPos;
   

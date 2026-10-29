@@ -85,6 +85,18 @@
         </optgroup>
       </select>
     </div>
+
+    <!-- Allowed Sites (New) -->
+    <details class="instance-section">
+      <summary class="instance-header" style="cursor:pointer">
+        <span style="font-weight:500;font-size:13px">Allowed Sites</span>
+      </summary>
+      <div style="margin-top: 8px;">
+        <textarea id="allowedSites" rows="3" style="width:96%;font-size:11px;padding:4px;" placeholder="*chatgpt.com*&#10;*claude.ai*"></textarea>
+        <div style="font-size:10px;color:#666;margin:4px 0">Allowed domains (glob patterns). Default sites always enabled.</div>
+        <button id="saveAllowedSites" style="width:100%;padding:4px;">Save Site List</button>
+      </div>
+    </details>
     
     <!-- Context Chips Section -->
     <div class="chips-section">
