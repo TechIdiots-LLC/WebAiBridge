@@ -110,7 +110,7 @@ let isFilePickerMode = false;
 let workspaceFiles = []; // populated via REQUEST_FILE_LIST
 
 // Available @ mention options
-const mentionOptions = [
+let mentionOptions = [
   { id: 'focused-file', icon: '📄', label: 'Focused File', description: 'Currently open file in VS Code', tokens: null },
   { id: 'selection', icon: '✂️', label: 'Selected Text', description: 'Current selection in VS Code', tokens: null },
   { id: 'visible-editors', icon: '📑', label: 'Visible Editors', description: 'All visible editor contents', tokens: null },
@@ -121,6 +121,37 @@ const mentionOptions = [
   { id: 'terminal', icon: '💻', label: 'Terminal Output', description: 'Recent terminal output', tokens: null },
   { id: 'file-search', icon: '🔍', label: 'Search Files...', description: 'Search for a specific file in workspace', tokens: null },
 ];
+
+function updateMentionOptionsWithChips() {
+  chrome.storage.local.get(['contextChips'], (res) => {
+    const chips = res?.contextChips || [];
+    
+    // reset to base options first to avoid duplicates
+    mentionOptions = mentionOptions.filter(o => !o.isChip);
+
+    chips.forEach(chip => {
+      mentionOptions.push({
+        id: `chip::${chip.id}`,
+        icon: '📌',
+        label: chip.label || (chip.text ? chip.text.slice(0, 20) + '...' : 'Context Chip'),
+        description: `Saved context (${estimateTokens(chip.text)} tokens)`,
+        tokens: estimateTokens(chip.text),
+        isChip: true,
+        text: chip.text // Store text for direct insertion
+      });
+    });
+  });
+}
+
+// Watch for chip changes
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.contextChips) {
+    updateMentionOptionsWithChips();
+  }
+});
+
+// Initial load
+updateMentionOptionsWithChips();
 
 // Detect which AI chat site we're on
 const SITE_CONFIG = {
@@ -2029,6 +2060,41 @@ function selectMentionOption(optionId) {
   // Close popover (insertInlineChip handles removal using savedRange)
   removeMentionPopover();
   
+  // Handle stored chip insertion immediately without network call
+  if (optionId.startsWith('chip::')) {
+    const chipOption = mentionOptions.find(o => o.id === optionId);
+    if (chipOption && chipOption.text) {
+      applyLimitMode(chipOption.text).then(limitResult => {
+         const chipLabel = chipOption.label;
+         const contentToInsert = limitResult.text;
+         
+         // Logic similar to network response
+         switch (limitResult.action) {
+          case 'insert':
+            insertInlineChip(optionId, chipLabel, limitResult.tokens, savedInput, contentToInsert, savedRange, savedQuery);
+            if (limitResult.wasTruncated) {
+              showNotification(`Content truncated from ${Tokenizer.formatTokenCount(limitResult.originalTokens)} to ${Tokenizer.formatTokenCount(limitResult.tokens)} tokens`, 'warning');
+            }
+            break;
+          case 'warn':
+             showLimitWarning(
+              limitResult.tokens, 
+              limitResult.limit,
+              () => {
+                insertInlineChip(optionId, chipLabel, limitResult.tokens, savedInput, contentToInsert, savedRange, savedQuery);
+              },
+              () => { console.debug('User cancelled insertion'); }
+            );
+            break;
+          case 'chunk':
+            showChunkNavigator(limitResult.chunks, savedInput, optionId, chipLabel, chipOption.text);
+            break;
+         }
+      });
+      return; 
+    }
+  }
+
   // Show loading indicator
   console.debug('Requesting context:', optionId);
   showLoadingIndicator(savedInput);
