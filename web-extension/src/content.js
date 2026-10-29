@@ -2365,6 +2365,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
 loadTriggerSetting();
 
 function handleInputForMention(e) {
+  // The chat relay (relay.js) is typing a prompt; don't open the menu for it
+  if (window.__wabRelayBusy) return;
   const target = e.target;
   console.debug('[WebAiBridge] handleInputForMention called; target=', target, 'lastFocusedInput=', lastFocusedInput);
   if (!target || (!target.isContentEditable && target.tagName !== 'TEXTAREA' && target.tagName !== 'INPUT')) {

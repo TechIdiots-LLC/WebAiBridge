@@ -2,6 +2,7 @@
 import * as path from "path";
 import * as fs from "fs";
 const { WebSocketServer } = require("ws");
+import { WebChatProvider, CHAT_VENDOR } from "./chatRelay";
 
 // Simple in-memory context cache to avoid repeated file reads
 class ContextCache {
@@ -121,6 +122,15 @@ export function activate(context: vscode.ExtensionContext) {
   let actualPort: number = 0;
   const clients = new Set<any>();
 
+  // Lets VS Code chat use AI chat sites open in the browser as models
+  const chatProvider = new WebChatProvider({
+    hasClients: () => clients.size > 0,
+    send: (message) => sendToClients(message),
+  });
+  context.subscriptions.push(
+    vscode.lm.registerLanguageModelChatProvider(CHAT_VENDOR, chatProvider),
+  );
+
   // Get workspace name for identification
   const workspaceName =
     vscode.workspace.workspaceFolders?.[0]?.name || "Untitled Workspace";
@@ -181,6 +191,13 @@ export function activate(context: vscode.ExtensionContext) {
       ws.on("message", (msg: any) => {
         try {
           const data = JSON.parse(msg.toString());
+
+          // Chat relay events arrive many times per reply; keep them out of the log
+          if (typeof data.type === "string" && data.type.startsWith("CHAT_")) {
+            chatProvider.handleMessage(data);
+            return;
+          }
+
           console.log("Received from bridge client:", data);
 
           // Handle PING request for instance discovery

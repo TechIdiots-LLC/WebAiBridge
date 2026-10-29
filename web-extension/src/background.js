@@ -140,6 +140,18 @@ function connectBridge(port = selectedPort) {
   ws.onmessage = (ev) => {
     try {
       const data = JSON.parse(ev.data);
+
+      // Chat relay requests from VS Code chat
+      if (data.type === "CHAT_REQUEST") {
+        handleChatRequest(data);
+        return;
+      }
+      if (data.type === "CHAT_CANCEL") {
+        const tabId = chatRequestTabs.get(data.requestId);
+        if (tabId) chrome.tabs.sendMessage(tabId, { type: "RELAY_CANCEL", requestId: data.requestId }, () => void chrome.runtime.lastError);
+        return;
+      }
+
       console.debug("Bridge message", data);
 
       // Handle instance info from VS Code
@@ -345,6 +357,66 @@ function connectBridge(port = selectedPort) {
   ws.onerror = (e) => {
     console.debug("Bridge error", e);
   };
+}
+
+// ==================== Chat relay ====================
+// VS Code chat sends CHAT_REQUEST; the matching site tab types the prompt in
+// and streams the reply back as CHAT_EVENT messages (see relay.js).
+
+const CHAT_SITE_URLS = {
+  gemini: ["https://gemini.google.com/*"],
+  claude: ["https://claude.ai/*"],
+};
+const chatTabs = new Map(); // conversationKey -> tab id
+const chatRequestTabs = new Map(); // requestId -> tab id
+
+function sendChatEvent(event) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(event));
+  }
+}
+
+async function handleChatRequest(data) {
+  const fail = (message) =>
+    sendChatEvent({ type: "CHAT_ERROR", requestId: data.requestId, message });
+
+  const patterns = CHAT_SITE_URLS[data.site];
+  if (!patterns) return fail(`Unsupported site: ${data.site}`);
+
+  let tabId = chatTabs.get(data.conversationKey);
+  if (tabId !== undefined) {
+    try {
+      await chrome.tabs.get(tabId);
+    } catch (e) {
+      tabId = undefined;
+    }
+  }
+  if (tabId === undefined) {
+    const tabs = await chrome.tabs.query({ url: patterns });
+    const inUse = new Set(chatTabs.values());
+    tabId = (tabs.find((t) => !inUse.has(t.id)) || tabs[0])?.id;
+  }
+  if (tabId === undefined) {
+    return fail(`Open ${patterns[0].replace("/*", "")} in Chrome first.`);
+  }
+
+  chatTabs.set(data.conversationKey, tabId);
+  chatRequestTabs.set(data.requestId, tabId);
+  chrome.tabs.sendMessage(
+    tabId,
+    {
+      type: "RELAY_CHAT",
+      requestId: data.requestId,
+      site: data.site,
+      newConversation: data.newConversation,
+      text: data.text,
+    },
+    () => {
+      if (chrome.runtime.lastError) {
+        fail("Could not reach the page. Reload the tab so the extension can attach to it.");
+      }
+    },
+  );
 }
 
 // Format multiple chips into a nicely formatted text block
@@ -567,6 +639,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     sendResponse({ ok: true });
     return true;
+  }
+
+  // Chat relay events from a site tab, forwarded on to VS Code
+  if (msg?.type === "CHAT_EVENT") {
+    sendChatEvent(msg.event);
+    if (msg.event?.type === "CHAT_DONE" || msg.event?.type === "CHAT_ERROR") {
+      chatRequestTabs.delete(msg.event.requestId);
+    }
+    return;
   }
 
   // Send AI response back to VS Code

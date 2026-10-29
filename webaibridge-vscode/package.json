@@ -14,13 +14,19 @@
     "Machine Learning"
   ],
   "engines": {
-    "vscode": "^1.70.0"
+    "vscode": "^1.104.0"
   },
   "activationEvents": [
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "webaibridge",
+        "displayName": "WebAiBridge"
+      }
+    ],
     "commands": [
       {
         "command": "webaibridge.login",
@@ -196,7 +202,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "^18.0.0",
-    "@types/vscode": "^1.70.0",
+    "@types/vscode": "^1.104.0",
     "@types/ws": "^8.5.10",
     "typescript": "^5.0.0",
     "prettier": "^3.8.0",

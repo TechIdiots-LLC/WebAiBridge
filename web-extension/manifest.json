@@ -26,7 +26,8 @@
       ],
       "js": [
         "src/tokenizer.js",
-        "src/content.js"
+        "src/content.js",
+        "src/relay.js"
       ],
       "run_at": "document_start"
     }

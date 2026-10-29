@@ -54,6 +54,16 @@ code --install-extension webaibridge-*.vsix
 2. Type `@` in the chat input to see available context options
 3. Or in VS Code: select code → right-click → **Add Selection to Context**
 
+## Use as a VS Code chat model (experimental)
+
+With both extensions installed, **Gemini (web)** and **Claude (web, experimental)** appear in the VS Code chat model picker under WebAiBridge. Choose one and chat as usual: the prompt is typed into the matching site open in Chrome, and the reply is streamed back into VS Code.
+
+- Open the site (gemini.google.com or claude.ai) in Chrome first, signed in, and reload the tab if it was open before installing the extension.
+- Chat only. Tool calling and agent mode are not supported, since the web sites don't return structured tool calls.
+- Each VS Code conversation maps to one web chat. After the first message only the newest message is sent, because the site keeps its own history.
+- It drives the site's page, so it can break when the site changes its layout. The page selectors are in [`web-extension/src/relay.js`](web-extension/src/relay.js). Check that automating a site is permitted by its terms of use.
+- Requires VS Code 1.104 or newer.
+
 ## Usage
 
 ### @ Mentions (in AI Chat)
